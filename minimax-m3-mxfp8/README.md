@@ -404,3 +404,7 @@ Primary supporting reports:
 4. Combine fused shared expert with the deploy-safe D stack and re-run the
    component boundary; only then update the production TPM calculation.
 5. Run a model/task quality evaluation before considering Top-K frequency 4.
+
+## Reports
+
+- [Accuracy validation vs NVIDIA's published numbers](accuracy/README.md): GSM8K 94.77, GPQA-D 92.12, AA-LCR 74.00, SciCode 48.9, tau2-Telecom 92.98 — all aligned; index-cache long-context bug found (37→72).
