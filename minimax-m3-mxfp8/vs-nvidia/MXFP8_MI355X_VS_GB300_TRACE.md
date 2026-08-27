@@ -50,6 +50,32 @@ P critical-path budget was:
 | AllReduce + norm | 18.24% | 96.636 | 81.934 |
 | Dense-layer MLP | 0.36% | 1.885 | 2.596 |
 
+### P kernel-level event detail
+
+This table expands each event-timed stage by its architectural call count.
+These rows are nested details, so they must not be added to the top-level
+budget above. Unlike the D profiler table discussed later, both P columns were
+measured with matching low-overhead device events.
+
+| Kernel/stage | Calls/pass | MI355X ms/pass | GB300 ms/pass | MI / GB |
+|---|---:|---:|---:|---:|
+| Routed MXFP8 MoE | 57 | 198.091 | 108.986 | 1.818x |
+| Dense attention core | 3 | 114.658 | 11.836 | 9.687x |
+| Sparse attention core/path | 57 | 116.379 | 74.823 | 1.555x |
+| INT4/fused AllReduce + norm | 120 | 96.636 | 81.934 | 1.179x |
+| Sparse indexer | 57 | 48.080 | 30.973 | 1.552x |
+| Shared-expert MLP | 57 | 36.963 | 24.913 | 1.484x |
+| Sparse QKV projection | 57 | 28.647 | 17.458 | 1.641x |
+| Attention output projection | 60 | 22.308 | 10.880 | 2.050x |
+| MLP gate/up projection | 60 | 21.293 | 13.799 | 1.543x |
+| MLP down projection | 60 | 16.413 | 8.164 | 2.010x |
+| MoE router | 57 | 3.554 | 16.537 | 0.215x |
+| Dense QKV projection | 3 | 0.948 | 0.812 | 1.167x |
+
+The largest removable P budgets are routed MoE (89.104 ms/pass), dense
+attention core (102.822 ms/pass despite appearing in only three layers), and
+sparse attention (41.556 ms/pass).
+
 ## D-only result
 
 Matched service workload: TP4, DecodeBenchConnector, EAGLE3 draft-3 synthetic
@@ -92,6 +118,50 @@ Low-overhead HIP events later measured the complete target iteration at
 | AllReduce + norm | 1.240 ms | 2.25% |
 | Dense-layer MLP | 0.273 ms | 0.50% |
 | Other captured-graph work | 14.340 ms | 26.05% |
+
+#### D nested event targets
+
+These event boundaries are contained in the rows above and must not be added
+again. They are the finest trustworthy D critical-path attribution currently
+available.
+
+| Kernel/stage boundary | MI355X ms/iteration | Iteration share |
+|---|---:|---:|
+| Routed-expert / routing residual | 9.890 | 17.96% |
+| Dense-attention backend core | 8.868 | 16.11% |
+| Sparse-attention body, excluding indexer | 7.854 | 14.27% |
+| Indexer | 4.943 | 8.98% |
+| Sparse projections / cache / output | 3.825 | 6.95% |
+| Shared-expert MLP | 2.868 | 5.21% |
+| MoE router gate | 0.732 | 1.33% |
+
+#### D exact trace kernel names (diagnostic only)
+
+The trace still identifies which concrete kernels execute, but its shares and
+collective latency are distorted by profiling. This table is therefore for
+kernel mapping only; it must not replace the event table above or be used for
+an Amdahl calculation.
+
+| Platform | Trace kernel | Mean us/call | Interpretation |
+|---|---|---:|---|
+| MI355X | `kernel_unified_attention` | 2,130.446 | Dense attention candidate |
+| MI355X | `decode_index_score_topk_partial_fp8` | 156.652 | Fused index-score/partial Top-K |
+| MI355X | AITER MoE1 + SwiGLU | 75.379 | Routed expert gate/up + activation |
+| MI355X | AITER MoE2 | 41.264 | Routed expert down projection |
+| MI355X | `mxfp8_linear_kernel` | 11.271 | MXFP8 dense/projection GEMM |
+| MI355X | `gqa_sparse_decode_kernel` | 14.928 | Sparse decode attention core |
+| GB300 | `kernel_unified_attention` | 1,516.991 | Dense attention candidate |
+| GB300 | FlashInfer sparse indexer Top-K | 21.386 | Top-K portion; not one-to-one with AMD fused kernel |
+| GB300 | MiniMax index-decode score | 18.586 | Score portion; not one-to-one with AMD fused kernel |
+| GB300 | TRT-LLM MXFP8 MoE gate/up BMM | 45.278 | Dominant gate/up shape |
+| GB300 | TRT-LLM MXFP8 MoE down BMM | 28.692 | Dominant down shape |
+| GB300 | FlashInfer MXFP8 dense GEMM | 9.496 | MXFP8 dense/projection GEMM |
+| GB300 | `gqa_sparse_decode_kernel` | 16.251 | Sparse decode attention core |
+
+The two platforms do not always use one-to-one kernel decomposition. For
+example, AMD fuses index score and partial Top-K while GB300 reports separate
+score and Top-K kernels. Direct ratios should only be computed for equivalent
+boundaries under matched event timing.
 
 The supported conclusion is that MI355X D is primarily limited by
 attention/indexer and remaining graph work, not communication bandwidth. The
