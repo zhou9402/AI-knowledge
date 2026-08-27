@@ -1,5 +1,9 @@
 # MiniMax-M3 MXFP8 Optimization Summary
 
+## Cross-platform comparison
+
+- [MI355X versus GB300 MXFP8 trace and event comparison](vs-nvidia/MXFP8_MI355X_VS_GB300_TRACE.md)
+
 ## Executive summary
 
 This work optimized MiniMax-M3 MXFP8 serving on MI355X with vLLM, focusing on
