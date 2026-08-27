@@ -33,6 +33,28 @@ Attention-related kernels total 27.18%. The previous partial list omitted the
 remaining 72.82%; it was not a complete trace breakdown. Percentages use
 29,338.14 ms of rank-0 GPU kernel time, not CPU or wall-clock time.
 
+## Preserved vLLM trace breakdown
+
+The preserved vLLM rank-0 trace contains two fixed 4096-token prefill steps and
+predates the current INT4 QuickReduce final stack.
+
+| Category | GPU kernel time |
+|---|---:|
+| Communication / collectives | 40.82% |
+| Routed MoE | 22.92% |
+| Dense/shared GEMM | 15.55% |
+| Sparse attention core | 10.15% |
+| Quantization / norm / activation / copy | 8.35% |
+| Dense attention | 1.07% |
+| QKV norm / RoPE / cache | 0.67% |
+| Sparse index / Top-K | 0.42% |
+| Other framework / metadata | 0.05% |
+
+Attention-related kernels total 12.32% in this fixed-shape capture. It is not
+directly comparable to the ATOM production open-loop trace because the request
+schedule and collective implementation differ. A matched current-stack vLLM
+capture is still required.
+
 ## Matched P sparse-core UT
 
 The GPU-event UT excludes index score, Top-K, metadata construction, and
