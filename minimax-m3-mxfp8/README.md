@@ -28,10 +28,11 @@ This is:
   comparison is a reference comparison, not a strictly matched kernel-only
   A/B.
 
-The remaining vLLM-versus-ATOM P-only gap is likely concentrated in attention,
-especially sparse attention and the indexer. ATOM reaches 4.959 QPS under the
+The remaining vLLM-versus-ATOM P-only gap is concentrated in attention,
+especially sparse attention. ATOM reaches 4.959 QPS under the
 same P-only SLA workload, versus vLLM's current quality-qualified 3.429--3.45
-QPS.
+QPS. A real-shape UT shows only a 1.53% combined Indexer/Top-K difference, so
+the indexer kernel itself is not the principal gap.
 
 ## Current decision snapshot
 
@@ -42,66 +43,48 @@ QPS.
 | BF16 EAGLE GEMM tuning | Kernel +3.04--25.81% | Deploy-safe |
 | Sparse QK-norm/cache fusion | D +4.10%; limit 2.10 to 2.20 QPS | Deploy-safe |
 | Fused routed + shared expert | D +6.02% at C22 | Requalify with final stack |
-| Top-K + metadata fusion | Subpath +10.1--12.1% | UT-qualified only |
+| Top-K + metadata fusion | Real P shape: subpath +7.16%; Indexer + Top-K combined +1.53% | UT-qualified only |
 | Cross-layer Top-K reuse | P 3.45 to 3.83 QPS | Rejected: quality drift |
-| ATOM-style dense attention | UT about 3.0--3.3x; no E2E gain | Integration investigation |
+| ATOM-style dense attention | Random-data full path 2.12--2.16x; prior E2E was offered-rate limited | Boundary A/B needed |
 | Shuffled KV/native-zero path | P benefit | Rejected: PD output corruption |
 | AITER sparse attention replacement | About 2.7x slower than Triton | Rejected |
 
-## MoE status versus ATOM
+## Current INT4 event distribution
 
-The latest traces attribute nearly the same fraction of GPU kernel time to
-MoE:
+The current P stack was measured with synchronized GPU events and P-side INT4
+QuickReduce, not profiler attribution. Sparse attention is 39.484%, MoE
+31.668%, INT4 QuickReduce 18.061%, dense attention 6.712%, and other work
+4.075%. Other all-reduce is 0.575%, so total communication is 18.636%.
+QuickReduce events were all INT4 and account for 96.91% of measured all-reduce
+time. This supersedes the obsolete roughly 40% communication trace, which did
+not use P-side INT4 QuickReduce.
 
-| Runtime | MoE share of GPU kernel time |
-|---|---:|
-| ATOM P trace | 17.3% |
-| vLLM current P trace | 17.39% |
-
-This supports the conclusion that MoE is no longer the dominant source of the
-vLLM-versus-ATOM P gap. It does **not** prove equal absolute MoE performance:
-the traces use different schedules and total execution times, so only a
-matched-shape absolute kernel comparison can establish parity. MoE still
-accounts for about 17% of vLLM GPU time and the fused shared-expert candidate
-shows a remaining D-only opportunity, but attention/indexer is now the higher
-priority.
+These event shares are not directly comparable to ATOM's profiler shares.
+Instrumentation reduced achieved QPS by 12.89%, so clean uninstrumented runs
+remain authoritative for capacity.
 
 ## Why the dense-attention UT gain did not translate to E2E
 
-The isolated production-like UT compared the current AITER Unified direct
+The production-shape UT compared the current AITER Unified direct
 paged-FP8 path with an ATOM-style FP8 KV gather/dequant + BF16 FMHA +
 prefix-chunk merge pipeline:
 
 | UT shape | Current | ATOM-style | Speedup |
 |---|---:|---:|---:|
-| q8192, prefix73728 | 9.513 ms | 2.900 ms | 3.28x |
-| 2 x q4096, prefix36864 | 4.857 ms | 1.545 ms | 3.14x |
-| 4 x q2048, prefix18432 | 2.490 ms | 0.830 ms | 3.00x |
+| q8192, prefix73728 | 9.549 ms | 4.431 ms | 2.155x |
+| 2 x q4096, prefix36864 | 4.869 ms | 2.293 ms | 2.123x |
+| 4 x q2048, prefix18432 | 2.509 ms | 1.178 ms | 2.130x |
 
-Correctness was acceptable (`relL2=0.002867`, max absolute error
-`0.0009766`). However, the short E2E A/B was flat: the control achieved 3.2785
+Correctness passed (`relL2=0.00285--0.00398`, cosine at least `0.999992`).
+However, the short E2E A/B was flat: the control achieved 3.2785
 QPS and the candidate achieved 3.2762 QPS at the same offered rate.
 
-The UT result therefore proves a kernel opportunity, not an integrated gain.
-The leading explanations are:
-
-1. The E2E experiment selected vLLM's standard `ROCM_AITER_FA` backend and
-   forced block size 128; it did not prove that every dense layer dispatched
-   through the exact ATOM-style pipeline measured by the UT.
-2. Production uses dynamic query/chunk/prefix shapes. The UT used a small set
-   of fixed, cache-hot shapes, while observed E2E shapes vary substantially.
-3. KV gather/dequant, block-table and metadata preparation, workspace setup,
-   prefix-chunk merge, and extra launches can consume the FMHA-core saving.
-4. Most M3 layers use sparse attention. Replacing dense attention does not
-   improve sparse GQA, index-score, or Top-K kernels.
-5. The short open-loop run was offered-rate limited, so nearly identical
-   achieved QPS is insufficient to expose a higher service boundary.
-
-The decisive next measurement is a matched-request event breakdown around KV
-gather/dequant, FMHA core, chunk merge, metadata preparation, and total dense
-attention, together with dispatch and actual-shape logging. If the fast core is
-not selected, fix dispatch; if conversion dominates, fuse it or retain an
-FP8-native path; if only dynamic shapes regress, tune the E2E-observed buckets.
+The dispatch question is now closed: the E2E log contains both the candidate
+gather and merge kernels. Gather plus merge costs only 0.14--0.29 ms, so it
+does not erase the gain. The old 3.0--3.3x estimate was inflated by zero-filled
+timing data; the random-data full-path result above is authoritative. The flat
+E2E result is explained by the offered-rate ceiling plus limited coverage:
+only 3 of M3's 60 layers use dense attention. A clean boundary A/B is needed.
 
 ## P-only attention implementation matrix
 
@@ -129,7 +112,7 @@ while dense linear layers used the PTPC-FP8 online-quant configuration.
 layers/projections. It must not be confused with the attention core itself.
 
 The exact ATOM P dispatch is now closed. A matched production-shape P-side UT
-also shows the ATOM sparse core is 1.98--2.02x faster than vLLM's current
+also shows the ATOM sparse core is 2.076x faster than vLLM's current
 Triton core, excluding score, Top-K, metadata construction, and cross-layer
 reuse. The trace percentages are attribution evidence only because profiling
 perturbs timing; the matched GPU-event UT is the performance comparison.
@@ -394,6 +377,7 @@ shuffled KV and the dense-attention backend replacement are rejected.
 
 Primary supporting reports:
 
+- [INT4 event breakdown and real-P-shape attention UT](reports/M3_MXFP8_REAL_P_EVENT_AND_UT_20260827.md)
 - [Sweet-point event timing and detailed optimization log](reports/MXFP4_MXFP8_SWEETPOINT_EVENT_TIMING_2302_2305.md)
 - [MXFP8 tuned P/D matched A/B](reports/MXFP8_TUNED_P_D_AB_2292_2297.md)
 - [ATOM fused-shared-expert screening](reports/ATOM_MXFP8_FSE_KERNEL_UT_2626.md)
@@ -402,12 +386,12 @@ Primary supporting reports:
 
 ## Recommended next steps
 
-1. Integrate or port the validated ATOM page-16 Gluon sparse core without
-   changing Top-K frequency, then run P E2E A/B.
+1. Integrate or reproduce the validated ATOM sparse core on vLLM's production
+   FP8 page-128 contract without changing Top-K frequency, then run P E2E A/B.
 2. Keep Top-K/metadata fusion separate from cross-layer reuse and qualify its
    whole-model effect.
-3. Use the confirmed dense gather + BF16 FMHA dispatch to explain why the
-   earlier vLLM backend substitution lost its UT gain at integration.
+3. Run a clean service-boundary A/B for the confirmed dense gather + BF16 FMHA
+   path; the previous fixed offered-rate test could not expose capacity.
 4. Combine fused shared expert with the deploy-safe D stack and re-run the
    component boundary; only then update the production TPM calculation.
 5. Run a model/task quality evaluation before considering Top-K frequency 4.
