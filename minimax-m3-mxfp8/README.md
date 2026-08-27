@@ -109,10 +109,17 @@ This matrix refers to the compared TP4 MXFP8 P-only results. It separates
 runtime facts confirmed by commands/source from the ATOM dense pipeline that
 still needs dispatch-level confirmation.
 
+The ATOM column corresponds to the run that reached 5.0 offered QPS / 4.959
+achieved QPS: TP4, 60K--120K ISL, eight prefix sessions, about 90% prefix
+reuse, OSL=1, MBT=16384, block size 128, FP8 main/index KV, prefix caching,
+`cudagraph_mode=FULL`, `ATOM_FORCE_ATTN_TRITON=1`, and
+`use_index_cache=true,index_topk_freq=4`. Its MXFP8 MoE weights were retained
+while dense linear layers used the PTPC-FP8 online-quant configuration.
+
 | Stage | ATOM P | vLLM deploy-safe P | Important difference |
 |---|---|---|---|
 | Dense attention selection | `ATOM_FORCE_ATTN_TRITON=1`; Triton prefill path | `ROCM_AITER_UNIFIED_ATTN` | Different runtime/backend path |
-| Dense attention core | Available source/UT evidence is consistent with FP8 paged-KV gather/dequant, BF16 FMHA, then prefix-chunk merge; exact E2E kernel dispatch is not yet captured | `aiter.ops.triton.unified_attention.unified_attention`, directly consuming paged FP8 KV; trace kernels `kernel_unified_attention` and `kernel_unified_attention_2d` | ATOM may pay conversion/merge launches; vLLM keeps FP8 KV native through the unified kernel |
+| Dense attention core | The 5.0-QPS run confirms Triton selection but does not preserve a dispatch trace identifying every dense-attention kernel. FP8 paged-KV gather/dequant, BF16 FMHA, then prefix-chunk merge is the later ATOM-style UT candidate, not a proven description of that E2E run | `aiter.ops.triton.unified_attention.unified_attention`, directly consuming paged FP8 KV; trace kernels `kernel_unified_attention` and `kernel_unified_attention_2d` | ATOM's exact 5.0-QPS dense path still requires dispatch capture; vLLM's path is confirmed |
 | Sparse index cache | FP8 | FP8 | Same dtype, different surrounding layout/dispatch |
 | Sparse score/Top-K | ATOM M3 Triton indexer; `use_index_cache=true,index_topk_freq=4` | AMD Triton `_index_block_score_kernel` + `_topk_index_kernel`; production-safe config recomputes every sparse layer | ATOM recomputes once per four sparse layers and reuses selected blocks; this is an algorithmic quality trade-off, not a kernel-only speedup |
 | Sparse metadata/layout | Top-K path emits the shuffled physical page-16 sparse table directly | Top-K ids stay in the shared buffer and feed the logical page-128 path | ATOM fuses table emission; vLLM avoids the shuffled page-16 contract |
