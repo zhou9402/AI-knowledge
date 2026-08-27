@@ -66,26 +66,20 @@ C72 is a GB300 scheduler boundary: only 64 requests were resident and up to
 eight were waiting. The like-for-like resident C48--C64 range shows GB300 at
 1.90--1.99x MI355X throughput with roughly half the TPOT.
 
-### Matched C16 profiler comparison
+### D trace validity correction
 
-The following totals sum GPU kernels across four TP ranks and streams. They
-are useful for locating kernel families, but are not wall-clock shares because
-overlap and synchronization waits are included.
+The earlier Kineto trace reported 51.41% of summed MI355X GPU time as
+collective/synchronization. That number is invalid for kernel-share or
+critical-path comparison: profiling reduced MI355X C16 throughput by about
+70% and greatly amplified device-side synchronization waits. It is therefore
+removed from the comparison table and must not be used to diagnose D.
 
-| Kernel family | MI355X share | GB300 share | MI / GB total time |
-|---|---:|---:|---:|
-| Collective / synchronization | 51.41% | 34.54% | 2.909x |
-| Attention + sparse indexer | 25.89% | 28.83% | 1.756x |
-| MoE, including routed BMMs | 9.11% | 18.11% | 0.984x |
-| MXFP8 linear + quantization | 3.10% | 10.13% | 0.599x |
-| Norm / activation / RoPE | 3.04% | 1.85% | 3.223x |
-| All summed kernels | 100% | 100% | 1.954x |
+The NVIDIA and AMD profiler-family percentages are also not directly
+comparable under this asymmetric perturbation. A matched low-overhead event
+run on both platforms would be required for a valid family-by-family D
+comparison.
 
-This profiler reduced MI355X C16 throughput by about 70%. Therefore the 51.41%
-collective number must not be interpreted as the production critical path.
-It mainly reflects synchronization waiting amplified by Kineto.
-
-### Corrected MI355X D event breakdown
+### Authoritative MI355X D event breakdown
 
 Low-overhead HIP events later measured the complete target iteration at
 55.053 ms:
@@ -99,16 +93,18 @@ Low-overhead HIP events later measured the complete target iteration at
 | Dense-layer MLP | 0.273 ms | 0.50% |
 | Other captured-graph work | 14.340 ms | 26.05% |
 
-The corrected conclusion is that D is primarily limited by attention/indexer
-and remaining graph work, not communication bandwidth. MoE was already at
-parity in the matched trace, and the aggregate MI355X MXFP8 linear path was
-faster than GB300.
+The supported conclusion is that MI355X D is primarily limited by
+attention/indexer and remaining graph work, not communication bandwidth. The
+older profiler suggests that MoE is unlikely to explain the gap, but that
+cross-platform family comparison remains directional rather than an
+authoritative event-timed result.
 
 ## Optimization priorities
 
 1. P: dense attention, routed MoE, and sparse attention.
 2. D: dense+sparse attention and indexer; then unexplained graph work.
-3. Do not use the profiler-only 51% collective share as a production claim.
+3. Treat the profiler-only 51.41% collective share as invalidated by
+   instrumentation interference.
 4. Use clean runs for capacity and low-overhead events for attribution.
 
 ## Provenance
@@ -120,4 +116,3 @@ faster than GB300.
 - Corrected MI355X D event job: 2239.
 - Original working-tree report:
   `benchmarks/kernels/minimax_m3/MXFP8_PONLY_C8_MI355X_VS_GB300_KERNEL_TIMING.md`.
-
