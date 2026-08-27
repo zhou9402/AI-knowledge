@@ -28,16 +28,18 @@ This is:
   comparison is a reference comparison, not a strictly matched kernel-only
   A/B.
 
-The remaining vLLM-versus-ATOM P-only gap is concentrated in attention,
-especially sparse attention. ATOM reaches 4.959 QPS under the
-same P-only SLA workload, versus vLLM's current quality-qualified 3.429--3.45
-QPS. A real-shape UT shows only a 1.53% combined Indexer/Top-K difference, so
-the indexer kernel itself is not the principal gap.
+The deploy-safe production stack reaches 3.429--3.45 P-only QPS. The separate
+`opt/sparse-attention-paged` path already implements and validates AITER Gluon
+sparse paged attention and raises the P-only SLA boundary to 3.75 QPS. ATOM
+still reaches 4.959 QPS under the same SLA workload. A real-shape UT shows only
+a 1.53% combined Indexer/Top-K difference, so the indexer kernel itself is not
+the principal remaining gap.
 
 ## Current decision snapshot
 
 | Optimization | Measured result | Status |
 |---|---:|---|
+| AITER sparse paged attention | Same-load fresh tok/s +3.4%; P SLA boundary 3.45 to 3.75 QPS (+8.9%) | P-only complete; PD layout integration pending |
 | Exact-shape MXFP8 dense GEMM tuning | P +0.84%; D +1.53--2.12% | Deploy-safe |
 | D Top-K/index-score bucket | D +4.02% | Deploy-safe |
 | BF16 EAGLE GEMM tuning | Kernel +3.04--25.81% | Deploy-safe |
@@ -61,7 +63,13 @@ not use P-side INT4 QuickReduce.
 
 These event shares are not directly comparable to ATOM's profiler shares.
 Instrumentation reduced achieved QPS by 12.89%, so clean uninstrumented runs
-remain authoritative for capacity.
+remain authoritative for capacity. This event run selected the Triton sparse
+kernel; it did not enable the already-validated AITER sparse-paged path.
+
+The remaining blocker is specifically PD layout compatibility. The failed
+job-2390 integration used shuffled page-16 storage on P but unshuffled
+page-128 storage on D, so raw MoRI KV transfer copied bytes between different
+layouts and corrupted output. This does not invalidate the P-only optimization.
 
 ## Why the dense-attention UT gain did not translate to E2E
 
@@ -386,8 +394,9 @@ Primary supporting reports:
 
 ## Recommended next steps
 
-1. Integrate or reproduce the validated ATOM sparse core on vLLM's production
-   FP8 page-128 contract without changing Top-K frequency, then run P E2E A/B.
+1. Do not repeat sparse kernel UT or P-only sweet-point testing. Integrate the
+   existing AITER sparse-paged path into the deploy-safe PD stack by making P/D
+   transfer layouts compatible, then rerun the output-quality gate.
 2. Keep Top-K/metadata fusion separate from cross-layer reuse and qualify its
    whole-model effect.
 3. Run a clean service-boundary A/B for the confirmed dense gather + BF16 FMHA

@@ -6,9 +6,10 @@ Three checks were run in parallel against the current TP4 MXFP8 P stack:
 
 1. P-side INT4 QuickReduce is active. Communication is 18.636% of measured
    target-model GPU time, not the obsolete profiler result of roughly 40%.
-2. On real production P shapes, ATOM's sparse-attention core is 2.076x faster
-   than vLLM's current Triton core. This is the largest confirmed attention
-   opportunity.
+2. On real production P shapes, the AITER Gluon sparse-attention core is 2.076x
+   faster than the current Triton core. This path was already implemented and
+   P-only qualified separately; this UT reconfirmed it rather than discovering
+   a new optimization.
 3. The dense-attention candidate did dispatch in the previous E2E test.
    Gather/dequant and merge do not erase the gain; random-data UT retains a
    2.12--2.16x complete-path speedup. The flat E2E test was offered-rate
@@ -40,6 +41,11 @@ shared expert 7.434%, and router 0.795%.
 Event instrumentation reduced achieved QPS from the uninstrumented 3.429 to
 2.987 (-12.89%). These percentages are attribution only; the clean run remains
 the capacity result.
+
+This run selected Triton and therefore does not describe the previously
+qualified `opt/sparse-attention-paged` stack. The remaining deployment issue is
+PD transfer compatibility: failed job 2390 used shuffled page-16 storage on P
+and unshuffled page-128 storage on D, so raw KV bytes did not preserve layout.
 
 ## 2. Real production P-shape attention UT
 
@@ -77,10 +83,9 @@ relative L2 0.00285--0.00398 and cosine 0.999992--0.999996.
 
 ## Priority
 
-1. Integrate or reproduce the ATOM sparse-attention core on vLLM's production
-   FP8 page-128 contract.
+1. Do not repeat the completed sparse kernel or P-only capacity work. Make the
+   existing sparse-paged cache layout safe for PD transfer and qualify output.
 2. Measure a clean boundary A/B for dense attention; do not infer capacity from
    the prior offered-3.45-QPS run.
 3. Keep fused Top-K/metadata as a smaller opportunity. Do not attribute ATOM's
    cross-layer reuse gain to the kernel itself.
-
