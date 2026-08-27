@@ -81,6 +81,10 @@ sparse attention (41.556 ms/pass).
 Matched service workload: TP4, DecodeBenchConnector, EAGLE3 draft-3 synthetic
 acceptance, 60K--120K token-ID input, exact OSL600, and two client warm-ups.
 
+*(This D table is the pre-optimization MI355X record; the 2026-08-27
+rematch with the optimized MI355X stack is in the next section. Read its
+residency reconciliation before comparing tok/s across the two.)*
+
 | C | MI355X out tok/s | GB300 out tok/s | GB / MI | MI TPOT P50 | GB TPOT P50 |
 |---:|---:|---:|---:|---:|---:|
 | 48 | 1,596.94 | 3,032.48 | 1.899x | 29.025 ms | 14.283 ms |
@@ -169,152 +173,140 @@ older profiler suggests that MoE is unlikely to explain the gap, but that
 cross-platform family comparison remains directional rather than an
 authoritative event-timed result.
 
+## D-only rematch (2026-08-27): optimized MI355X stack
+
+Same C64 D-only workload (TP4, DecodeBenchConnector fill_mean=0.015, EAGLE3
+draft-3 synthetic acceptance [0.7, 0.5, 0.4], 60K--120K token-ID input,
+OSL600, 192 prompts = 3 waves, seed 42). The MI355X side now runs the
+optimized stack: vLLM 0.27.2rc1 (image ac750) + the integrated ws1/ws2/ws3
+kernel ports — aiter PTPC (`gemm_a8w8_bpreshuffle`) for all dense MXFP8
+linears by default, aiter fused AR+GemmaRMSNorm in `post_attn` mode (FFN-AR
+deferral is intentionally disabled under EAGLE3), and the decode-tier MXFP8
+fmoe tuned CSV on aiter 0.1.19. The ws4 gluon sparse-PA path stayed off: while
+the attend path runs eagerly (`eager_break_during_capture`) it is a net drag.
+GSM8K 5-shot (limit 100) on this stack: 0.96 strict-match. The GB300 side is
+unchanged (vLLM 0.17.2rc1.dev4448; job 10377 anchor, event job 10388).
+
+### Capacity (instrumentation off)
+
+| Platform | out tok/s | TPOT p50 | step (ITL p50) | TTFT p50 | EAGLE3 acc. len |
+|---|---:|---:|---:|---:|---:|
+| MI355X (optimized) | 1,724.35 | 23.434 ms | 60.12 ms | 2,125 ms | 2.599 (measured) |
+| GB300 | 3,620.99 | 16.032 ms | 36.57 ms | 412 ms | ~2.3--2.4 (ITL/TPOT) |
+| GB300 / MI355X | **2.100x** | **1.462x** (AMD/GB) | 1.64x | -- | -- |
+
+GB300's 2.100x measured-throughput lead decomposes exactly into decode speed
+times decode residency:
+
+    tok/s ratio = (TPOT_MI / TPOT_GB) x (residency_GB / residency_MI)
+    2.100       = 1.462             x 1.437
+
+where residency = measured tok/s / (C / TPOT p50) = 0.907 (GB300) vs 0.631
+(MI355X): the fraction of slot-time actually spent decoding. Each 60K--120K
+token request spends the rest in connector fill/queueing; the MI355X run's
+TTFT (p50 2.13 s, mean 5.5 s) is much heavier than GB300's (p50 0.41 s) on
+the same DecodeBenchConnector workload, so more of its 64 slots are
+non-decoding at any moment. TPOT is the apples-to-apples decode-speed metric;
+on tok/s, part of NV's lead is fill/queue speed, not decode kernels.
+
+### Reconciliation with the earlier record (1,832.65 tok/s / 33.212 ms)
+
+The old C64 row is the pre-optimization stack. Decode speed genuinely
+improved: TPOT 33.212 -> 23.434 ms (-29.4%), i.e. the pure-decode ceiling
+C/TPOT rose 1,927 -> 2,731 tok/s (+41.7%). Measured tok/s moved the other way
+(1,832.65 -> 1,724.35, -5.9%) purely through residency accounting: the old
+run implied ~95% decode residency (E2E 20.95 s = 19.93 s decode + ~1.0 s
+fill/queue per request), while the new run sits at 63% (E2E 22.27 s = 14.06 s
+decode + ~8.2 s fill/queue; TTFT p50 2.13 s). The new stack fills/queues the
+60K--120K prompts more slowly per request than the old record's stack did,
+which masks the decode win in aggregate throughput. Not a decode regression.
+
+### Per-decode-step stage budget (event-timed legs)
+
+Step identity: with EAGLE3 draft-3, every engine step is one target verify
+pass (4 positions/seq) plus three eager draft passes and the sampler. The hot
+C64 cudagraph is exactly the verify pass on both platforms (moe x57 +
+dense_attn x3 = one 60-layer target-model pass; MI355X graph ...626448 at
+55.01 ms/replay, GB300 graph ...723344 at 38.18 ms/replay). Per-replay stage
+time = p50 call time x calls per replay. Both legs are instrumented (MI355X
+event leg: -50.7% tok/s, +18.1% TPOT; GB300: -14.8% tok/s, +11.2% TPOT), so
+absolute stage times are inflated; use them for structure and shares. The
+verify-graph totals (55.01 vs 38.18 ms = 1.44x) track the clean TPOT ratio
+(1.462x), which cross-checks the attribution. Nesting: dense_attn_core is
+inside dense_attn; on the AMD model the MoE block time includes the router
+and the shared-expert MLP (MoE.forward calls them), while on GB300
+shared_expert_mlp is a sibling call (its stage times sum to the graph total
+without nesting).
+
+| Bucket | MI355X ms/step | GB300 ms/step | MI / GB |
+|---|---:|---:|---:|
+| Routed MoE block (incl. router) | 17.67 | 12.64 | 1.40x |
+| Shared-expert MLP | 2.93 | 10.66 | **0.27x (MI faster)** |
+| Dense attention (3 full-context layers) | 9.40 | 1.00 | 9.44x |
+| Sparse attn + indexer (57 layers) | 7.91 | n/a (uninstrumented, in step-graph gap) | -- |
+| AllReduce + norm | 2.02 | 4.08 | **0.49x (MI faster)** |
+| Projections / dense GEMMs | 4.77 | 7.99 | **0.60x (MI faster)** |
+| Sum of instrumented stages | 44.69 | 36.36 | -- |
+| Graph residual (see notes) | 10.32 | 1.82 | -- |
+| **Verify graph total** | **55.01** | **38.18** | **1.44x** |
+| Step, instrumented leg (ITL p50) | 68.02 | 42.31 | 1.61x |
+| Step, clean leg (ITL p50) | 60.12 | 36.57 | 1.64x |
+
+Notes on the buckets:
+
+- Sparse attn + indexer, MI355X: sparse decode 43.1 us x57 + merge; index
+  score+topk ~300 us x15 per step (index_topk_freq=4 cross-layer reuse: a
+  quarter of the 57 sparse layers refresh per step).
+- Sparse attn + indexer, GB300: not instrumented inside the verify graph (its
+  stages sum to the graph total without it); from the prior trace it is
+  ~0.9 ms sparse decode + ~1.3 ms indexer at this geometry, inside the
+  step-minus-graph gap (<=4.1 ms with draft/sampler).
+- AllReduce + norm: MI355X runs 60 fused calls/step (ws3 `post_attn`: one
+  fused AR+norm per layer; the FFN keeps its internal AR under EAGLE3).
+  GB300 runs 120: its 0.17 model defers the FFN AR into the next layer's
+  norm — structurally the ws3 `all` mode that EAGLE3 blocks on AMD.
+- Graph residual: MI355X 10.32 ms (logits/sampler at 256 verify tokens,
+  EAGLE3 aux-hidden capture, in-graph event-record overhead, other
+  uninstrumented work) vs GB300 1.82 ms. This is the least-characterized
+  MI355X bucket.
+- Non-graph work per step (3 draft passes, sampler, host) is ~5 ms on
+  MI355X (clean-leg step minus instrumented graph) and within noise on
+  GB300 (the on-leg graph time is inflated ~10%).
+
+### Where the remaining GB300 decode advantage comes from
+
+Verify-graph delta is 55.01 - 38.18 = 16.8 ms/step (1.44x, matching the
+clean TPOT ratio 1.462x):
+
+- Dense attention over the full 60K--120K context (3 layers): +8.4 ms for
+  MI355X (9.44x) — the single largest kernel-level gap.
+- Graph residual / uninstrumented work: +8.5 ms for MI355X.
+- Routed MoE block: +5.0 ms (1.40x).
+- Offset by MI355X wins from the ws1/ws2/ws3 ports: shared-expert MLP
+  -7.7 ms (3.6x faster), projections -3.2 ms (1.7x), AR+norm -2.1 ms (2x).
+
+The 2.100x measured-tok/s lead additionally carries the 1.437x residency
+factor (connector fill/queue overhead per request, not decode kernels).
+
+### What the optimization bought (same D-only workload, prior record -> now)
+
+| C64 | TPOT p50 | Decode ceiling (C/TPOT) | Measured tok/s |
+|---|---:|---:|---:|
+| Pre-optimization record | 33.212 ms | 1,927 tok/s | 1,832.65 |
+| Optimized stack | 23.434 ms (-29.4%) | 2,731 tok/s (+41.7%) | 1,724.35 (see residency note) |
+
 ## Optimization priorities
 
 1. P: dense attention, routed MoE, and sparse attention.
-2. D: dense+sparse attention and indexer; then unexplained graph work.
+2. D (updated 2026-08-27): dense attention remains the top kernel target
+   (9.4x, ~8.4 ms/step at C64); second is the verify-graph residual on
+   MI355X (~10 ms/step: logits/sampler, EAGLE3 aux capture, in-graph event
+   overhead — needs direct instrumentation); routed MoE is 1.40x; the
+   connector fill/queue path drives the residency gap (1.44x of the 2.10x
+   tok/s lead) and is a scheduling/connector problem, not a kernel one.
 3. Treat the profiler-only 51.41% collective share as invalidated by
    instrumentation interference.
 4. Use clean runs for capacity and low-overhead events for attribution.
-
-## AMD SOTA kernel-level breakdown (2026-08-27)
-
-torch-profiler kernel-level decomposition of the current AMD SOTA stack —
-the stage table above is event-window based; this section gives the raw
-per-kernel accounting (names, calls, durations, shares) for the same P-only
-workload on the p1 stack.
-
-- Job: Slurm **3173**, node `vultr-mi355x-04`, artifacts under
-  `vllm-m3-wt-p1/benchmarks/kernels/minimax_m3/results/p1-mxfp8-p-c8-torch-profile-fmha/sweep-3173/`
-  (rank-0 trace `dp0_pp0_tp0...rank0.*.pt.trace.json.gz`; per-kernel TSV
-  alongside it as `*.kernels.tsv`).
-- Stack: `integration/p1` @ `fb5d693`, source overlay from
-  `/mnt/vfs/homes/peiyuanz/vllm-m3-wt-p1`; toggles: fp8q MoE CSV
-  (`minimax_m3_mxfp8_fp8q_prefill_recommended.csv`), dense GEMM sweetpoint
-  overlay (sha `37fb8890...`), `M3_USE_ROCM_AITER_UNIFIED_ATTN_OVERLAY=1` +
-  `VLLM_ROCM_AITER_UNIFIED_ATTN_FMHA_PREFILL=1` (CK FMHA varlen dense
-  prefill), shuffle KV layout + native KV zero, QuickReduce INT4, TP4, MXFP8
-  target `MiniMax-M3-MXFP8-c5454eb0-NV-KV`, EAGLE3 MXFP4 draft
-  (TRITON_ATTN), synthetic spec. PTPC and `index_topk_freq>1` OFF per the
-  standing precision decision. **Note:** the unified-attention overlay is
-  load-bearing for FMHA — the image's `rocm_aiter_unified_attn.py` predates
-  it, so the env var alone is a no-op (first attempt, job 3171, lacked the
-  overlay and silently ran the old Triton dense path; 3171 is kept as the
-  FMHA-off A/B reference below).
-- Run health: all sbatch gates passed; profiled throughput 31,303.8 fresh
-  tok/s vs the 3155 uninstrumented control 31,636.2 (**1.05%** profiler
-  overhead — the kernel mix is production-representative). This trace is for
-  kernel attribution only; throughput conclusions stay with the
-  uninstrumented runs.
-- Window: 26 target-model steps (counted via `vllm::moe_forward_shared` =
-  57 x 26), wall span 12,700.8 ms, GPU kernel-busy 12,486.3 ms = **98.3% of
-  wall, single stream** (stream 1 has 26 calls, negligible). Each step is a
-  mixed batch: one 16,384-token prefill chunk + decode/verify tokens + 3
-  EAGLE3 draft forwards. Per-step values below divide by 26; shares are of
-  total kernel-busy time. `execute_context_*` rows in the profiler table are
-  `user_annotation` markers (not kernels) and are excluded.
-
-### Top kernels (rank 0, full names)
-
-| Kernel | calls | /step | total ms | ms/step | mean us | share |
-|---|---:|---:|---:|---:|---:|---:|
-| `quickreduce::allreduce_prototype_twoshot<AllReduceTwoshot<__half, CodecQ4<__half,4>, true>, __half>` | 3,100 | 119.2 | 2,139.8 | 82.30 | 690.3 | 17.14% |
-| `kernel_unified_attention.kd` (EAGLE3 draft attn, TRITON_ATTN) | 78 | 3.0 | 1,554.3 | 59.78 | 19,927.3 | 12.45% |
-| `_mxfp8_linear_kernel.kd` (Triton dot_scaled MXFP8 dense GEMM) | 6,240 | 240.0 | 1,887.2 | 72.58 | 302.4 | 15.11% |
-| `mfma_moe1_silu_mul_afp8_wfp8_fp8_t128x128x256_pm1_fp8q_sort_async_gui_xcd4_swiglu_v32.kd` (routed MoE stage 1, fp8q) | 1,368 | 52.6 | 1,197.7 | 46.07 | 875.5 | 9.59% |
-| `mfma_moe2_afp8_wfp8_bf16_cshuffle_t128x128x256_vscale_fix3_fp4opt_v1_pm1.kd` (routed MoE stage 2) | 1,425 | 54.8 | 975.0 | 37.50 | 684.2 | 7.81% |
-| `_index_block_score_kernel.kd` (indexer scores) | 1,482 | 57.0 | 871.2 | 33.51 | 587.8 | 6.98% |
-| `paged_attention_decode_sliding_window_head_1.kd` (gluon AITER_SPARSE_PA) | 1,482 | 57.0 | 805.7 | 30.99 | 543.6 | 6.45% |
-| `fmha_fwd_hd128_bf16_causal_groupE.kd` (CK FMHA varlen, target dense attn) | 78 | 3.0 | 793.6 | 30.52 | 10,174.3 | 6.36% |
-| `_topk_index_kernel.kd` (indexer top-k) | 1,482 | 57.0 | 380.8 | 14.65 | 257.0 | 3.05% |
-| `_gemma_fused_add_rmsnorm_kernel.kd` (post-AR add+norm) | 3,120 | 120.0 | 359.3 | 13.82 | 115.2 | 2.88% |
-| `_kernel.kd` (`vllm::mxfp8_quantize`, dense-GEMM activation quant) | 6,240 | 240.0 | 337.4 | 12.98 | 54.1 | 2.70% |
-| `aten::add` big bf16 (57 MoE shared-expert combine + 3 EAGLE3 aux) | 1,560 | 60.0 | 150.8 | 5.80 | 96.7 | 1.21% |
-| `__amd_rocclr_copyBuffer.kd` (scheduler/metadata copies) | 2,366 | 91.0 | 103.2 | 3.97 | 43.6 | 0.83% |
-| `dynamic_per_group_scaled_quant` (aiter, in-MoE per_1x32 quant) | 1,482 | 57.0 | 96.8 | 3.72 | 65.3 | 0.78% |
-| `aten::mul_` bf16x2.0 (MoE `routed_scaling_factor`) | 1,482 | 57.0 | 80.3 | 3.09 | 54.2 | 0.64% |
-| `Cijk_Alik_Bljk_BSS_..._MT128x64x128_...` (hipBLAS bf16 GEMM, MoE router gate) | 1,311 | 50.4 | 80.4 | 3.09 | 61.3 | 0.64% |
-| `fusedMiniMaxM3QNormRopeKVInsertKernel<bf16,u8,fp8,_,true,...>` (sparse QK-norm+RoPE+KV insert) | 1,482 | 57.0 | 69.8 | 2.68 | 47.1 | 0.56% |
-| `opus_moe_sorting_entry` P23+P0+P1+clear (MoE sorting) | 5,700 | 219.2 | 80.6 | 3.10 | ~14 | 0.65% |
-| `cross_device_reduce_2stage<bfloat16_t,4>` (aiter custom AR remainder) | 124 | 4.8 | 55.1 | 2.12 | 444.1 | 0.44% |
-| `bf16gemm_bf16_tn_256x256` (draft bf16 GEMM) | 25 | 1.0 | 54.8 | 2.11 | 2,192.7 | 0.44% |
-| `_swiglu_oai_kernel.kd` (shared-expert + dense-MLP activation) | 1,560 | 60.0 | 34.9 | 1.34 | 22.3 | 0.28% |
-| `CatArrayBatchedCopy_contig` (spec-decode concat) | 130 | 5.0 | 28.8 | 1.11 | 221.2 | 0.23% |
-| `reshape_and_cache_kernel<...,fp8,true>` (aiter sparse KV insert) | 1,482 | 57.0 | 22.6 | 0.87 | 15.3 | 0.18% |
-| `grouped_topk_kernel<float,float4,4,...>` (router top-k) | 1,482 | 57.0 | 22.3 | 0.86 | 15.1 | 0.18% |
-| `_build_sparse_block_table_prefill_kernel.kd` | 1,482 | 57.0 | 20.1 | 0.77 | 13.6 | 0.16% |
-| `_gemm_afp4wfp4_kernel_...` (draft MXFP4 GEMM) | 50 | 1.9 | 20.7 | 0.80 | 413.3 | 0.17% |
-| `mfma_moe1_silu_mul_afp8_wfp8_bf16_t128x128x256_pm1_async_gui_swiglu_v32.kd` (MoE s1, bf16 bucket) | 57 | 2.2 | 21.3 | 0.82 | 374.0 | 0.17% |
-| `mxfp4_moe_sort_kernel<256,32,24,32>` | 1,425 | 54.8 | 14.5 | 0.56 | 10.2 | 0.12% |
-| `_insert_index_cache_kernel.kd` | 1,482 | 57.0 | 13.1 | 0.50 | 8.9 | 0.10% |
-| `cp_mha_gather_cache_kernel.kd` (paged-KV gather feeding FMHA) | 78 | 3.0 | 12.0 | 0.46 | 154.3 | 0.10% |
-
-The 38 listed rows cover 98.7% of kernel-busy time; the tail (draft norms
-`add_rmsnorm_quant` 0.53 ms/step, small-M MoE variants, RCCL remainder
-`ncclDevKernel_Generic_1` 0.12 ms/step, dense-layer `rotary_embedding` /
-`reshape_and_cache_flash` / `scaled_fp8_quant` 0.16 ms/step, indexing glue)
-is in the TSV.
-
-### Kernel -> stage mapping
-
-Stage names follow the event-window stage table in this document and its p1
-companion (`MXFP8_P_SOTA_VS_GB300_20260827.md`).
-
-| Stage | Kernels (per target step) |
-|---|---|
-| Routed MoE (`moe`) | `mfma_moe1_*` + `mfma_moe2_*` (all bucket variants) + `opus_moe_sorting_*` + `mxfp4_moe_sort` + in-MoE `dynamic_per_group_scaled_quant` — 2395.3 ms / 92.1 ms/step total; fp8q bucket variants (`..._fp8q_sort_async_...`) carry 52.6/57 calls per step, bf16/t32 variants the small-M steps |
-| Shared-expert MLP | 114 of the 240/step `_mxfp8_linear_kernel.kd` (gate_up+down) + 114 quant `_kernel.kd` + 57 of 60 `_swiglu_oai_kernel.kd`; then the `aten::mul_` (routed scale) + 57 of 60 `aten::add` (shared+routed combine) |
-| Sparse QKV projection / Attention output projection / Dense MLP proj | the rest of `_mxfp8_linear_kernel.kd` + `_kernel.kd` (240/step each = 60 qkv + 60 o_proj + 57x2 shared + 3x2 dense MLP) |
-| Indexer | `_index_block_score_kernel.kd` + `_topk_index_kernel.kd` (+ `_build_sparse_block_table_prefill`, `_insert_index_cache`) |
-| Sparse attention total | `paged_attention_decode_sliding_window_head_1.kd` (gluon) + block-table build |
-| Dense attention core | `fmha_fwd_hd128_bf16_causal_groupE.kd` + `cp_mha_gather_cache_kernel.kd` (new CK FMHA varlen path; 3 dense layers) |
-| AllReduce + norm | `quickreduce::allreduce_prototype_twoshot` (QR INT4, 120/step) + `_gemma_fused_add_rmsnorm_kernel.kd` (120/step) + `cross_device_reduce_*` / `ncclDevKernel_Generic_1` remainders |
-| QK-norm+RoPE+KV insert | `fusedMiniMaxM3QNormRopeKVInsertKernel` (57/step fp8-index variant + 3/step dense variant) + aiter `reshape_and_cache` (sparse, fp8) |
-| MoE router | `grouped_topk_kernel` + router-gate hipBLAS GEMM (`Cijk_...`, 57/step on full-chunk steps) |
-| EAGLE3 draft (not a target-model stage) | `kernel_unified_attention.kd` (3/step, TRITON_ATTN backend), `bf16gemm_bf16_tn_256x256`, `_gemm_afp4wfp4_kernel`, `_dynamic_mxfp4_quant_kernel`, aiter `add_rmsnorm_quant`, `wvSplitK_hf_sml_*`, `CatArrayBatchedCopy`, argmax `reduce_kernel` |
-
-### Self-consistency with the event-stage table (job 3156)
-
-Per-call kernel sums vs the stage-window means (stage windows include eager
-CPU launch gaps; kernels are pure GPU busy):
-
-| Stage | stage us/call | kernel us/call | kernel/stage |
-|---|---:|---:|---:|
-| AllReduce + norm | 808.5 | 690.3 (QR) + 115.2 (norm) = 805.5 | **1.00x** |
-| Indexer | 865.5 | 587.8 + 257.0 = 844.8 | **1.02x** |
-| Dense attention core | 14,843.8 | 10,174.3 + 154.3 = 10,328.6 | 1.44x |
-| Routed MoE | 3,390.5 | 875.5 + 684.2 + ~66 (sort) + 65.3 (quant) = 1,691 | ~2.0x |
-| Sparse attention total | 1,529.1 | 543.6 + 13.6 = 557.2 | ~2.7x |
-
-AR+norm and the indexer are kernel-dense (stage ~= kernel); routed MoE and
-sparse attention still lose ~2-2.7x of their stage window to eager launch
-gaps — consistent with the fusion/launch-overhead directions being pursued
-(norm-rope fusion, FMoE bucket tuning, residual-add fusion).
-
-### Notable findings
-
-1. **EAGLE3 draft attention is a first-class cost on P-only long-context:**
-   `kernel_unified_attention.kd` (draft, TRITON_ATTN backend, 3 forwards per
-   step over 60-120K context) burns 59.8 ms/step = **12.45% of kernel time**
-   — ~2x the target model's entire sparse-attention kernel time (31.0
-   ms/step). The draft does not use the unified/FMHA path;
-   `opt/draft-prefill-attn` (draft FMHA prefill) exists but is not in p1.
-2. **FMHA dense prefill confirmed live** (`fmha_fwd_hd128_bf16_causal_groupE`
-   3/step + `cp_mha_gather_cache` 3/step), replacing the Triton
-   `kernel_unified_attention_2d.kd` (9.98 ms/call) used by the FMHA-off
-   control job 3171; at these shapes the CK FMHA kernel itself is at parity
-   with unified-2d (10.17 vs 9.98 ms/call) plus a 154 us gather — the
-   stage-level dense-attention win (-61% vs the old stack) comes from the
-   old stack's much slower path, not from FMHA beating unified-2d here.
-3. **Residual elementwise leftovers:** the 60 `aten::add` (5.8 ms/step) + 57
-   `aten::mul_` (3.1 ms/step) are exactly the set addressed by
-   `opt/residual-add-fusion` (not in p1).
-4. **240 standalone activation quants per step** (`_kernel.kd`, 13.0
-   ms/step) feeding the dense MXFP8 GEMMs — the AR-epilogue norm+quant
-   fusion (`opt/ar-epilogue-fusion`, not in p1) targets ~65 of them.
-5. MoE stage-1/stage-2 kernel mix: fp8q variants cover 52.6/57 calls per
-   step (full 16,384 chunks); small-M steps fall back to the bf16/t32
-   bucket variants (mfma_moe1 bf16 374 us, t32 108/58 us).
 
 ## Provenance
 
@@ -323,60 +315,10 @@ gaps — consistent with the fusion/launch-overhead directions being pursued
 - MI355X D profiler job: 2221.
 - GB300 D profiler job: 9724.
 - Corrected MI355X D event job: 2239.
+- 2026-08-27 D rematch: MI355X event legs `results-nv-amd/amd/event-c64/`
+  (off = clean capacity, on = event timing; vultr-mi355x, vllm-bench-ac750,
+  192 prompts, seed 42, hot graph 13885675626448); GB300 repro job 10377 and
+  event job 10388 (hot graph 266659190723344). Analysis scripts and tables:
+  `tools/m3_compare/nv-amd-compare/` and remote `results-nv-amd/compare/`.
 - Original working-tree report:
   `benchmarks/kernels/minimax_m3/MXFP8_PONLY_C8_MI355X_VS_GB300_KERNEL_TIMING.md`.
-
----
-
-## D-only rematch at AMD sweet spot, C64 (2026-08-27, event-timed, optimized MI355X stack)
-
-Post-kernel-port MI355X stack (ws1 MoE tuned-CSV + ws2 PTPC aiter GEMM + ws3 fused
-AR+norm; ws4 gluon OFF — eager-path regression). GB300 unchanged (canonical config).
-Protocol: TP4, DecodeBenchConnector (fill 0.015), EAGLE3 draft-3 synthetic
-acceptance [0.7,0.5,0.4], 60K-120K token-id ISL, OSL 600, C64 closed loop.
-Timing: HIP/CUDA-event stage timing, OFF leg for capacity, ON leg for stage shares
-(instrumentation cost: GB300 ~11-15%, MI355X ~17.5% TPOT — stage tables are
-relative shares only).
-
-### Capacity (timing OFF, zero errors both sides)
-
-| Platform | out tok/s | TPOT P50 | vs |
-|---|---:|---:|---|
-| GB300 (job 10377, repro of canonical) | **3,620.99** | **16.03 ms** | 1.00x |
-| MI355X optimized (this work) | 1,724.4 | 23.43 ms | NV = **2.10x** tok/s, 1.46x TPOT |
-| MI355X pre-optimization (earlier record) | 1,832.65 | 33.21 ms | — |
-
-MI355X optimization moved TPOT 33.2 -> 23.4 ms (-29%). Raw tok/s is dominated by
-the synchronous DecodeBenchConnector KV-fill TTFT at this run length (MI TTFT p90
-13.7 s), so TPOT is the clean decode metric; the tok/s dip vs the old record is
-wave/accounting noise, not a regression.
-
-### Per-stage decode-step comparison (verify cudagraph, per-call us, relative shares)
-
-| stage (per call) | MI355X opt. | GB300 | MI / GB |
-|---|---:|---:|---:|
-| Routed MoE (per layer, x57) | 312.7 | 220.9 | **1.42x** |
-| Dense attention (per layer, x3) | 3,135 | 331.8 | **9.45x** |
-| Index score+topk (x15) | 301.8 | — | n/a |
-| Shared-expert MLP (x57) | 51.8 | 185.2 | 0.28x (MI faster) |
-| Sparse decode kernel (x57) | 43.6 | — | n/a |
-| AR+norm fused (x120) | 35.2 | 34.0 | 1.04x (parity) |
-| sparse QKV proj (x57) | 18.7 | 17.7 | 1.06x |
-| attn o_proj (x60) | 15.5 | 14.7 | 1.05x |
-
-MI355X verify-graph step budget: MoE 41.0%, dense attn 20.6%, index topk 9.9%,
-shared-expert MLP 6.8%, sparse decode 5.6%, AR+norm 5.0%; ~15 ms/step residual =
-EAGLE3 draft forwards + sampler + scheduler (not instrumented).
-
-### Read
-
-- GB300's 2.1x lead at C64 is led by **dense attention (9.45x; 3 layers at 60-120K
-  ctx)** and routed MoE (1.42x); AR/norm and the projection GEMMs are at parity
-  after the kernel ports.
-- ws3 (fused AR+norm) holds parity with trtllm allreduce fusion — the glue gap is
-  closed. The remaining MI355X decode gap is dense-attention-bound.
-
-### Artifacts
-
-- MI355X: `vultr-mi355x:/mnt/vfs/homes/peiyuanz/m3-compare/results-nv-amd/amd/event-c64/{off,on,on-gated}/` (SUMMARY.md, stage TSVs); optimized-stack decode record in `records/DECODE_OPTIMIZATION_RECORD.md`.
-- GB300: repro `results/mxfp8/decode-only/c64-10377/`, event `results/mxfp8-event-stage6/decode-only/c64-10388/` (exit-2 is a summary-jq bug; measurement complete); copied to `vultr:.../results-nv-amd/gb300/`.
