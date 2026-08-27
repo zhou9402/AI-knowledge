@@ -33,6 +33,83 @@ especially sparse attention and the indexer. ATOM reaches 4.959 QPS under the
 same P-only SLA workload, versus vLLM's current quality-qualified 3.429--3.45
 QPS.
 
+## Current decision snapshot
+
+| Optimization | Measured result | Status |
+|---|---:|---|
+| Exact-shape MXFP8 dense GEMM tuning | P +0.84%; D +1.53--2.12% | Deploy-safe |
+| D Top-K/index-score bucket | D +4.02% | Deploy-safe |
+| BF16 EAGLE GEMM tuning | Kernel +3.04--25.81% | Deploy-safe |
+| Sparse QK-norm/cache fusion | D +4.10%; limit 2.10 to 2.20 QPS | Deploy-safe |
+| Fused routed + shared expert | D +6.02% at C22 | Requalify with final stack |
+| Top-K + metadata fusion | Subpath +10.1--12.1% | UT-qualified only |
+| Cross-layer Top-K reuse | P 3.45 to 3.83 QPS | Rejected: quality drift |
+| ATOM-style dense attention | UT about 3.0--3.3x; no E2E gain | Integration investigation |
+| Shuffled KV/native-zero path | P benefit | Rejected: PD output corruption |
+| AITER sparse attention replacement | About 2.7x slower than Triton | Rejected |
+
+## MoE status versus ATOM
+
+The latest traces attribute nearly the same fraction of GPU kernel time to
+MoE:
+
+| Runtime | MoE share of GPU kernel time |
+|---|---:|
+| ATOM P trace | 17.3% |
+| vLLM current P trace | 17.39% |
+
+This supports the conclusion that MoE is no longer the dominant source of the
+vLLM-versus-ATOM P gap. It does **not** prove equal absolute MoE performance:
+the traces use different schedules and total execution times, so only a
+matched-shape absolute kernel comparison can establish parity. MoE still
+accounts for about 17% of vLLM GPU time and the fused shared-expert candidate
+shows a remaining D-only opportunity, but attention/indexer is now the higher
+priority.
+
+## Why the dense-attention UT gain did not translate to E2E
+
+The isolated production-like UT compared the current AITER Unified direct
+paged-FP8 path with an ATOM-style FP8 KV gather/dequant + BF16 FMHA +
+prefix-chunk merge pipeline:
+
+| UT shape | Current | ATOM-style | Speedup |
+|---|---:|---:|---:|
+| q8192, prefix73728 | 9.513 ms | 2.900 ms | 3.28x |
+| 2 x q4096, prefix36864 | 4.857 ms | 1.545 ms | 3.14x |
+| 4 x q2048, prefix18432 | 2.490 ms | 0.830 ms | 3.00x |
+
+Correctness was acceptable (`relL2=0.002867`, max absolute error
+`0.0009766`). However, the short E2E A/B was flat: the control achieved 3.2785
+QPS and the candidate achieved 3.2762 QPS at the same offered rate.
+
+The UT result therefore proves a kernel opportunity, not an integrated gain.
+The leading explanations are:
+
+1. The E2E experiment selected vLLM's standard `ROCM_AITER_FA` backend and
+   forced block size 128; it did not prove that every dense layer dispatched
+   through the exact ATOM-style pipeline measured by the UT.
+2. Production uses dynamic query/chunk/prefix shapes. The UT used a small set
+   of fixed, cache-hot shapes, while observed E2E shapes vary substantially.
+3. KV gather/dequant, block-table and metadata preparation, workspace setup,
+   prefix-chunk merge, and extra launches can consume the FMHA-core saving.
+4. Most M3 layers use sparse attention. Replacing dense attention does not
+   improve sparse GQA, index-score, or Top-K kernels.
+5. The short open-loop run was offered-rate limited, so nearly identical
+   achieved QPS is insufficient to expose a higher service boundary.
+
+The decisive next measurement is a matched-request event breakdown around KV
+gather/dequant, FMHA core, chunk merge, metadata preparation, and total dense
+attention, together with dispatch and actual-shape logging. If the fast core is
+not selected, fix dispatch; if conversion dominates, fuse it or retain an
+FP8-native path; if only dynamic shapes regress, tune the E2E-observed buckets.
+
+## Update policy
+
+This repository is the canonical record for subsequent MiniMax-M3 MXFP8
+optimization results. New qualified measurements, rejected candidates, and
+changes to the production recommendation should be appended here together
+with their workload contract and evidence.
+
 ## Benchmark contract
 
 - Hardware: MI355X, TP4.
