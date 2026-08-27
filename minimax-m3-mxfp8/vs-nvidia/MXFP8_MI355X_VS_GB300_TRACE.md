@@ -16,8 +16,10 @@ warm-ups, and 48 measured requests.
 | Platform | Instrumented fresh tok/s | Request/s | TTFT P50 |
 |---|---:|---:|---:|
 | MI355X | 21,315.20 | 2.6757 | 3,033.02 ms |
+| MI355X SOTA (2026-08-27, integration/p1) | 29,446.58 | 3.6965 | 2,183.68 ms |
 | GB300 | 44,135.29 | 5.5404 | 1,415.08 ms |
 | GB300 / MI355X | **2.071x** | **2.071x** | -- |
+| GB300 / MI355X SOTA | **1.499x** | **1.499x** | -- |
 
 The uninstrumented GB300 control reached 46,527.69 fresh tok/s. Event
 instrumentation reduced GB300 throughput by 5.14%, so it did not inflate the
@@ -27,28 +29,28 @@ reported NVIDIA advantage.
 
 Times are mean microseconds per call. Stages are nested and must not be added.
 
-| Stage | MI355X us/call | GB300 us/call | MI / GB |
-|---|---:|---:|---:|
-| Routed MoE | 3,475.273 | 1,912.037 | 1.818x |
-| Shared-expert MLP | 648.470 | 437.064 | 1.484x |
-| Sparse QKV projection | 502.578 | 306.279 | 1.641x |
-| Attention output projection | 371.800 | 181.330 | 2.050x |
-| Indexer | 843.501 | 543.389 | 1.552x |
-| AllReduce + norm | 805.301 | 682.786 | 1.179x |
-| Sparse attention total | 2,041.734 | 1,312.677 | 1.555x |
-| Dense attention core | 38,219.372 | 3,945.283 | 9.687x |
+| Stage | MI355X us/call | MI355X SOTA 08-27 us/call | GB300 us/call | MI / GB |
+|---|---:|---:|---:|---:|
+| Routed MoE | 3,475.273 | 3,390.5 | 1,912.037 | 1.818x |
+| Shared-expert MLP | 648.470 | 653.5 | 437.064 | 1.484x |
+| Sparse QKV projection | 502.578 | 498.5 | 306.279 | 1.641x |
+| Attention output projection | 371.800 | 364.3 | 181.330 | 2.050x |
+| Indexer | 843.501 | 865.5 | 543.389 | 1.552x |
+| AllReduce + norm | 805.301 | 808.5 | 682.786 | 1.179x |
+| Sparse attention total | 2,041.734 | 1,529.1 | 1,312.677 | 1.555x |
+| Dense attention core | 38,219.372 | 14,843.8 | 3,945.283 | 9.687x |
 
 Dense attention appears in only three layers; routed MoE and sparse attention
 repeat across 57 layers. Expanded by architectural multiplicity, the MI355X
 P critical-path budget was:
 
-| Top-level bucket | MI share | MI ms/pass | GB300 ms/pass |
-|---|---:|---:|---:|
-| Routed MoE | 37.40% | 198.091 | 108.986 |
-| Dense attention | 22.03% | 116.721 | 13.640 |
-| Sparse attention | 21.97% | 116.379 | 74.823 |
-| AllReduce + norm | 18.24% | 96.636 | 81.934 |
-| Dense-layer MLP | 0.36% | 1.885 | 2.596 |
+| Top-level bucket | MI share | MI ms/pass | MI SOTA 08-27 ms/pass | GB300 ms/pass |
+|---|---:|---:|---:|---:|
+| Routed MoE | 37.40% | 198.091 | 193.3 | 108.986 |
+| Dense attention | 22.03% | 116.721 | 44.5 | 13.640 |
+| Sparse attention | 21.97% | 116.379 | 87.2 | 74.823 |
+| AllReduce + norm | 18.24% | 96.636 | 97.0 | 81.934 |
+| Dense-layer MLP | 0.36% | 1.885 | 2.0 | 2.596 |
 
 ### P kernel-level event detail
 
@@ -57,20 +59,20 @@ These rows are nested details, so they must not be added to the top-level
 budget above. Unlike the D profiler table discussed later, both P columns were
 measured with matching low-overhead device events.
 
-| Kernel/stage | Calls/pass | MI355X ms/pass | GB300 ms/pass | MI / GB |
-|---|---:|---:|---:|---:|
-| Routed MXFP8 MoE | 57 | 198.091 | 108.986 | 1.818x |
-| Dense attention core | 3 | 114.658 | 11.836 | 9.687x |
-| Sparse attention core/path | 57 | 116.379 | 74.823 | 1.555x |
-| INT4/fused AllReduce + norm | 120 | 96.636 | 81.934 | 1.179x |
-| Sparse indexer | 57 | 48.080 | 30.973 | 1.552x |
-| Shared-expert MLP | 57 | 36.963 | 24.913 | 1.484x |
-| Sparse QKV projection | 57 | 28.647 | 17.458 | 1.641x |
-| Attention output projection | 60 | 22.308 | 10.880 | 2.050x |
-| MLP gate/up projection | 60 | 21.293 | 13.799 | 1.543x |
-| MLP down projection | 60 | 16.413 | 8.164 | 2.010x |
-| MoE router | 57 | 3.554 | 16.537 | 0.215x |
-| Dense QKV projection | 3 | 0.948 | 0.812 | 1.167x |
+| Kernel/stage | Calls/pass | MI355X ms/pass | MI SOTA 08-27 ms/pass | GB300 ms/pass | MI / GB |
+|---|---:|---:|---:|---:|---:|
+| Routed MXFP8 MoE | 57 | 198.091 | 193.3 | 108.986 | 1.818x |
+| Dense attention core | 3 | 114.658 | 44.5 | 11.836 | 9.687x |
+| Sparse attention core/path | 57 | 116.379 | 87.2 | 74.823 | 1.555x |
+| INT4/fused AllReduce + norm | 120 | 96.636 | 97.0 | 81.934 | 1.179x |
+| Sparse indexer | 57 | 48.080 | 49.3 | 30.973 | 1.552x |
+| Shared-expert MLP | 57 | 36.963 | 37.2 | 24.913 | 1.484x |
+| Sparse QKV projection | 57 | 28.647 | 28.4 | 17.458 | 1.641x |
+| Attention output projection | 60 | 22.308 | 21.9 | 10.880 | 2.050x |
+| MLP gate/up projection | 60 | 21.293 | — | 13.799 | 1.543x |
+| MLP down projection | 60 | 16.413 | — | 8.164 | 2.010x |
+| MoE router | 57 | 3.554 | — | 16.537 | 0.215x |
+| Dense QKV projection | 3 | 0.948 | — | 0.812 | 1.167x |
 
 The largest removable P budgets are routed MoE (89.104 ms/pass), dense
 attention core (102.822 ms/pass despite appearing in only three layers), and
@@ -312,6 +314,8 @@ factor (connector fill/queue overhead per request, not decode kernels).
 
 - MI355X P event job: 2177.
 - GB300 P event job: 9695.
+- MI355X SOTA (integration/p1) jobs: 3155 (control), 3156 (event); kernel
+  profile job: 3173.
 - MI355X D profiler job: 2221.
 - GB300 D profiler job: 9724.
 - Corrected MI355X D event job: 2239.
