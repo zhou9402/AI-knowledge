@@ -177,6 +177,145 @@ authoritative event-timed result.
    instrumentation interference.
 4. Use clean runs for capacity and low-overhead events for attribution.
 
+## AMD SOTA kernel-level breakdown (2026-08-27)
+
+torch-profiler kernel-level decomposition of the current AMD SOTA stack —
+the stage table above is event-window based; this section gives the raw
+per-kernel accounting (names, calls, durations, shares) for the same P-only
+workload on the p1 stack.
+
+- Job: Slurm **3173**, node `vultr-mi355x-04`, artifacts under
+  `vllm-m3-wt-p1/benchmarks/kernels/minimax_m3/results/p1-mxfp8-p-c8-torch-profile-fmha/sweep-3173/`
+  (rank-0 trace `dp0_pp0_tp0...rank0.*.pt.trace.json.gz`; per-kernel TSV
+  alongside it as `*.kernels.tsv`).
+- Stack: `integration/p1` @ `fb5d693`, source overlay from
+  `/mnt/vfs/homes/peiyuanz/vllm-m3-wt-p1`; toggles: fp8q MoE CSV
+  (`minimax_m3_mxfp8_fp8q_prefill_recommended.csv`), dense GEMM sweetpoint
+  overlay (sha `37fb8890...`), `M3_USE_ROCM_AITER_UNIFIED_ATTN_OVERLAY=1` +
+  `VLLM_ROCM_AITER_UNIFIED_ATTN_FMHA_PREFILL=1` (CK FMHA varlen dense
+  prefill), shuffle KV layout + native KV zero, QuickReduce INT4, TP4, MXFP8
+  target `MiniMax-M3-MXFP8-c5454eb0-NV-KV`, EAGLE3 MXFP4 draft
+  (TRITON_ATTN), synthetic spec. PTPC and `index_topk_freq>1` OFF per the
+  standing precision decision. **Note:** the unified-attention overlay is
+  load-bearing for FMHA — the image's `rocm_aiter_unified_attn.py` predates
+  it, so the env var alone is a no-op (first attempt, job 3171, lacked the
+  overlay and silently ran the old Triton dense path; 3171 is kept as the
+  FMHA-off A/B reference below).
+- Run health: all sbatch gates passed; profiled throughput 31,303.8 fresh
+  tok/s vs the 3155 uninstrumented control 31,636.2 (**1.05%** profiler
+  overhead — the kernel mix is production-representative). This trace is for
+  kernel attribution only; throughput conclusions stay with the
+  uninstrumented runs.
+- Window: 26 target-model steps (counted via `vllm::moe_forward_shared` =
+  57 x 26), wall span 12,700.8 ms, GPU kernel-busy 12,486.3 ms = **98.3% of
+  wall, single stream** (stream 1 has 26 calls, negligible). Each step is a
+  mixed batch: one 16,384-token prefill chunk + decode/verify tokens + 3
+  EAGLE3 draft forwards. Per-step values below divide by 26; shares are of
+  total kernel-busy time. `execute_context_*` rows in the profiler table are
+  `user_annotation` markers (not kernels) and are excluded.
+
+### Top kernels (rank 0, full names)
+
+| Kernel | calls | /step | total ms | ms/step | mean us | share |
+|---|---:|---:|---:|---:|---:|---:|
+| `quickreduce::allreduce_prototype_twoshot<AllReduceTwoshot<__half, CodecQ4<__half,4>, true>, __half>` | 3,100 | 119.2 | 2,139.8 | 82.30 | 690.3 | 17.14% |
+| `kernel_unified_attention.kd` (EAGLE3 draft attn, TRITON_ATTN) | 78 | 3.0 | 1,554.3 | 59.78 | 19,927.3 | 12.45% |
+| `_mxfp8_linear_kernel.kd` (Triton dot_scaled MXFP8 dense GEMM) | 6,240 | 240.0 | 1,887.2 | 72.58 | 302.4 | 15.11% |
+| `mfma_moe1_silu_mul_afp8_wfp8_fp8_t128x128x256_pm1_fp8q_sort_async_gui_xcd4_swiglu_v32.kd` (routed MoE stage 1, fp8q) | 1,368 | 52.6 | 1,197.7 | 46.07 | 875.5 | 9.59% |
+| `mfma_moe2_afp8_wfp8_bf16_cshuffle_t128x128x256_vscale_fix3_fp4opt_v1_pm1.kd` (routed MoE stage 2) | 1,425 | 54.8 | 975.0 | 37.50 | 684.2 | 7.81% |
+| `_index_block_score_kernel.kd` (indexer scores) | 1,482 | 57.0 | 871.2 | 33.51 | 587.8 | 6.98% |
+| `paged_attention_decode_sliding_window_head_1.kd` (gluon AITER_SPARSE_PA) | 1,482 | 57.0 | 805.7 | 30.99 | 543.6 | 6.45% |
+| `fmha_fwd_hd128_bf16_causal_groupE.kd` (CK FMHA varlen, target dense attn) | 78 | 3.0 | 793.6 | 30.52 | 10,174.3 | 6.36% |
+| `_topk_index_kernel.kd` (indexer top-k) | 1,482 | 57.0 | 380.8 | 14.65 | 257.0 | 3.05% |
+| `_gemma_fused_add_rmsnorm_kernel.kd` (post-AR add+norm) | 3,120 | 120.0 | 359.3 | 13.82 | 115.2 | 2.88% |
+| `_kernel.kd` (`vllm::mxfp8_quantize`, dense-GEMM activation quant) | 6,240 | 240.0 | 337.4 | 12.98 | 54.1 | 2.70% |
+| `aten::add` big bf16 (57 MoE shared-expert combine + 3 EAGLE3 aux) | 1,560 | 60.0 | 150.8 | 5.80 | 96.7 | 1.21% |
+| `__amd_rocclr_copyBuffer.kd` (scheduler/metadata copies) | 2,366 | 91.0 | 103.2 | 3.97 | 43.6 | 0.83% |
+| `dynamic_per_group_scaled_quant` (aiter, in-MoE per_1x32 quant) | 1,482 | 57.0 | 96.8 | 3.72 | 65.3 | 0.78% |
+| `aten::mul_` bf16x2.0 (MoE `routed_scaling_factor`) | 1,482 | 57.0 | 80.3 | 3.09 | 54.2 | 0.64% |
+| `Cijk_Alik_Bljk_BSS_..._MT128x64x128_...` (hipBLAS bf16 GEMM, MoE router gate) | 1,311 | 50.4 | 80.4 | 3.09 | 61.3 | 0.64% |
+| `fusedMiniMaxM3QNormRopeKVInsertKernel<bf16,u8,fp8,_,true,...>` (sparse QK-norm+RoPE+KV insert) | 1,482 | 57.0 | 69.8 | 2.68 | 47.1 | 0.56% |
+| `opus_moe_sorting_entry` P23+P0+P1+clear (MoE sorting) | 5,700 | 219.2 | 80.6 | 3.10 | ~14 | 0.65% |
+| `cross_device_reduce_2stage<bfloat16_t,4>` (aiter custom AR remainder) | 124 | 4.8 | 55.1 | 2.12 | 444.1 | 0.44% |
+| `bf16gemm_bf16_tn_256x256` (draft bf16 GEMM) | 25 | 1.0 | 54.8 | 2.11 | 2,192.7 | 0.44% |
+| `_swiglu_oai_kernel.kd` (shared-expert + dense-MLP activation) | 1,560 | 60.0 | 34.9 | 1.34 | 22.3 | 0.28% |
+| `CatArrayBatchedCopy_contig` (spec-decode concat) | 130 | 5.0 | 28.8 | 1.11 | 221.2 | 0.23% |
+| `reshape_and_cache_kernel<...,fp8,true>` (aiter sparse KV insert) | 1,482 | 57.0 | 22.6 | 0.87 | 15.3 | 0.18% |
+| `grouped_topk_kernel<float,float4,4,...>` (router top-k) | 1,482 | 57.0 | 22.3 | 0.86 | 15.1 | 0.18% |
+| `_build_sparse_block_table_prefill_kernel.kd` | 1,482 | 57.0 | 20.1 | 0.77 | 13.6 | 0.16% |
+| `_gemm_afp4wfp4_kernel_...` (draft MXFP4 GEMM) | 50 | 1.9 | 20.7 | 0.80 | 413.3 | 0.17% |
+| `mfma_moe1_silu_mul_afp8_wfp8_bf16_t128x128x256_pm1_async_gui_swiglu_v32.kd` (MoE s1, bf16 bucket) | 57 | 2.2 | 21.3 | 0.82 | 374.0 | 0.17% |
+| `mxfp4_moe_sort_kernel<256,32,24,32>` | 1,425 | 54.8 | 14.5 | 0.56 | 10.2 | 0.12% |
+| `_insert_index_cache_kernel.kd` | 1,482 | 57.0 | 13.1 | 0.50 | 8.9 | 0.10% |
+| `cp_mha_gather_cache_kernel.kd` (paged-KV gather feeding FMHA) | 78 | 3.0 | 12.0 | 0.46 | 154.3 | 0.10% |
+
+The 38 listed rows cover 98.7% of kernel-busy time; the tail (draft norms
+`add_rmsnorm_quant` 0.53 ms/step, small-M MoE variants, RCCL remainder
+`ncclDevKernel_Generic_1` 0.12 ms/step, dense-layer `rotary_embedding` /
+`reshape_and_cache_flash` / `scaled_fp8_quant` 0.16 ms/step, indexing glue)
+is in the TSV.
+
+### Kernel -> stage mapping
+
+Stage names follow the event-window stage table in this document and its p1
+companion (`MXFP8_P_SOTA_VS_GB300_20260827.md`).
+
+| Stage | Kernels (per target step) |
+|---|---|
+| Routed MoE (`moe`) | `mfma_moe1_*` + `mfma_moe2_*` (all bucket variants) + `opus_moe_sorting_*` + `mxfp4_moe_sort` + in-MoE `dynamic_per_group_scaled_quant` — 2395.3 ms / 92.1 ms/step total; fp8q bucket variants (`..._fp8q_sort_async_...`) carry 52.6/57 calls per step, bf16/t32 variants the small-M steps |
+| Shared-expert MLP | 114 of the 240/step `_mxfp8_linear_kernel.kd` (gate_up+down) + 114 quant `_kernel.kd` + 57 of 60 `_swiglu_oai_kernel.kd`; then the `aten::mul_` (routed scale) + 57 of 60 `aten::add` (shared+routed combine) |
+| Sparse QKV projection / Attention output projection / Dense MLP proj | the rest of `_mxfp8_linear_kernel.kd` + `_kernel.kd` (240/step each = 60 qkv + 60 o_proj + 57x2 shared + 3x2 dense MLP) |
+| Indexer | `_index_block_score_kernel.kd` + `_topk_index_kernel.kd` (+ `_build_sparse_block_table_prefill`, `_insert_index_cache`) |
+| Sparse attention total | `paged_attention_decode_sliding_window_head_1.kd` (gluon) + block-table build |
+| Dense attention core | `fmha_fwd_hd128_bf16_causal_groupE.kd` + `cp_mha_gather_cache_kernel.kd` (new CK FMHA varlen path; 3 dense layers) |
+| AllReduce + norm | `quickreduce::allreduce_prototype_twoshot` (QR INT4, 120/step) + `_gemma_fused_add_rmsnorm_kernel.kd` (120/step) + `cross_device_reduce_*` / `ncclDevKernel_Generic_1` remainders |
+| QK-norm+RoPE+KV insert | `fusedMiniMaxM3QNormRopeKVInsertKernel` (57/step fp8-index variant + 3/step dense variant) + aiter `reshape_and_cache` (sparse, fp8) |
+| MoE router | `grouped_topk_kernel` + router-gate hipBLAS GEMM (`Cijk_...`, 57/step on full-chunk steps) |
+| EAGLE3 draft (not a target-model stage) | `kernel_unified_attention.kd` (3/step, TRITON_ATTN backend), `bf16gemm_bf16_tn_256x256`, `_gemm_afp4wfp4_kernel`, `_dynamic_mxfp4_quant_kernel`, aiter `add_rmsnorm_quant`, `wvSplitK_hf_sml_*`, `CatArrayBatchedCopy`, argmax `reduce_kernel` |
+
+### Self-consistency with the event-stage table (job 3156)
+
+Per-call kernel sums vs the stage-window means (stage windows include eager
+CPU launch gaps; kernels are pure GPU busy):
+
+| Stage | stage us/call | kernel us/call | kernel/stage |
+|---|---:|---:|---:|
+| AllReduce + norm | 808.5 | 690.3 (QR) + 115.2 (norm) = 805.5 | **1.00x** |
+| Indexer | 865.5 | 587.8 + 257.0 = 844.8 | **1.02x** |
+| Dense attention core | 14,843.8 | 10,174.3 + 154.3 = 10,328.6 | 1.44x |
+| Routed MoE | 3,390.5 | 875.5 + 684.2 + ~66 (sort) + 65.3 (quant) = 1,691 | ~2.0x |
+| Sparse attention total | 1,529.1 | 543.6 + 13.6 = 557.2 | ~2.7x |
+
+AR+norm and the indexer are kernel-dense (stage ~= kernel); routed MoE and
+sparse attention still lose ~2-2.7x of their stage window to eager launch
+gaps — consistent with the fusion/launch-overhead directions being pursued
+(norm-rope fusion, FMoE bucket tuning, residual-add fusion).
+
+### Notable findings
+
+1. **EAGLE3 draft attention is a first-class cost on P-only long-context:**
+   `kernel_unified_attention.kd` (draft, TRITON_ATTN backend, 3 forwards per
+   step over 60-120K context) burns 59.8 ms/step = **12.45% of kernel time**
+   — ~2x the target model's entire sparse-attention kernel time (31.0
+   ms/step). The draft does not use the unified/FMHA path;
+   `opt/draft-prefill-attn` (draft FMHA prefill) exists but is not in p1.
+2. **FMHA dense prefill confirmed live** (`fmha_fwd_hd128_bf16_causal_groupE`
+   3/step + `cp_mha_gather_cache` 3/step), replacing the Triton
+   `kernel_unified_attention_2d.kd` (9.98 ms/call) used by the FMHA-off
+   control job 3171; at these shapes the CK FMHA kernel itself is at parity
+   with unified-2d (10.17 vs 9.98 ms/call) plus a 154 us gather — the
+   stage-level dense-attention win (-61% vs the old stack) comes from the
+   old stack's much slower path, not from FMHA beating unified-2d here.
+3. **Residual elementwise leftovers:** the 60 `aten::add` (5.8 ms/step) + 57
+   `aten::mul_` (3.1 ms/step) are exactly the set addressed by
+   `opt/residual-add-fusion` (not in p1).
+4. **240 standalone activation quants per step** (`_kernel.kd`, 13.0
+   ms/step) feeding the dense MXFP8 GEMMs — the AR-epilogue norm+quant
+   fusion (`opt/ar-epilogue-fusion`, not in p1) targets ~65 of them.
+5. MoE stage-1/stage-2 kernel mix: fp8q variants cover 52.6/57 calls per
+   step (full 16,384 chunks); small-M steps fall back to the bf16/t32
+   bucket variants (mfma_moe1 bf16 374 us, t32 108/58 us).
+
 ## Provenance
 
 - MI355X P event job: 2177.
