@@ -15,6 +15,24 @@ ATOM's sparse path reinterprets logical page-128 FP8 KV as physical page-16
 SHUFFLE blocks. It is not the Triton sparse-prefill kernel used by vLLM. Trace
 shares are attribution evidence only because profiling perturbs timing.
 
+## Complete rank-0 GPU-kernel breakdown
+
+| Category | GPU kernel time |
+|---|---:|
+| Routed MoE | 29.59% |
+| Communication / fused collectives | 21.99% |
+| Quantization / norm / activation / copy | 12.19% |
+| Dense attention, including KV gather | 11.85% |
+| Dense/shared GEMM | 8.73% |
+| Sparse attention core | 8.73% |
+| Sparse index / Top-K | 3.70% |
+| QKV norm / RoPE / cache | 2.91% |
+| Other framework / metadata | 0.31% |
+
+Attention-related kernels total 27.18%. The previous partial list omitted the
+remaining 72.82%; it was not a complete trace breakdown. Percentages use
+29,338.14 ms of rank-0 GPU kernel time, not CPU or wall-clock time.
+
 ## Matched P sparse-core UT
 
 The GPU-event UT excludes index score, Top-K, metadata construction, and
