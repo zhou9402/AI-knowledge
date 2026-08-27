@@ -325,3 +325,58 @@ gaps — consistent with the fusion/launch-overhead directions being pursued
 - Corrected MI355X D event job: 2239.
 - Original working-tree report:
   `benchmarks/kernels/minimax_m3/MXFP8_PONLY_C8_MI355X_VS_GB300_KERNEL_TIMING.md`.
+
+---
+
+## D-only rematch at AMD sweet spot, C64 (2026-08-27, event-timed, optimized MI355X stack)
+
+Post-kernel-port MI355X stack (ws1 MoE tuned-CSV + ws2 PTPC aiter GEMM + ws3 fused
+AR+norm; ws4 gluon OFF — eager-path regression). GB300 unchanged (canonical config).
+Protocol: TP4, DecodeBenchConnector (fill 0.015), EAGLE3 draft-3 synthetic
+acceptance [0.7,0.5,0.4], 60K-120K token-id ISL, OSL 600, C64 closed loop.
+Timing: HIP/CUDA-event stage timing, OFF leg for capacity, ON leg for stage shares
+(instrumentation cost: GB300 ~11-15%, MI355X ~17.5% TPOT — stage tables are
+relative shares only).
+
+### Capacity (timing OFF, zero errors both sides)
+
+| Platform | out tok/s | TPOT P50 | vs |
+|---|---:|---:|---|
+| GB300 (job 10377, repro of canonical) | **3,620.99** | **16.03 ms** | 1.00x |
+| MI355X optimized (this work) | 1,724.4 | 23.43 ms | NV = **2.10x** tok/s, 1.46x TPOT |
+| MI355X pre-optimization (earlier record) | 1,832.65 | 33.21 ms | — |
+
+MI355X optimization moved TPOT 33.2 -> 23.4 ms (-29%). Raw tok/s is dominated by
+the synchronous DecodeBenchConnector KV-fill TTFT at this run length (MI TTFT p90
+13.7 s), so TPOT is the clean decode metric; the tok/s dip vs the old record is
+wave/accounting noise, not a regression.
+
+### Per-stage decode-step comparison (verify cudagraph, per-call us, relative shares)
+
+| stage (per call) | MI355X opt. | GB300 | MI / GB |
+|---|---:|---:|---:|
+| Routed MoE (per layer, x57) | 312.7 | 220.9 | **1.42x** |
+| Dense attention (per layer, x3) | 3,135 | 331.8 | **9.45x** |
+| Index score+topk (x15) | 301.8 | — | n/a |
+| Shared-expert MLP (x57) | 51.8 | 185.2 | 0.28x (MI faster) |
+| Sparse decode kernel (x57) | 43.6 | — | n/a |
+| AR+norm fused (x120) | 35.2 | 34.0 | 1.04x (parity) |
+| sparse QKV proj (x57) | 18.7 | 17.7 | 1.06x |
+| attn o_proj (x60) | 15.5 | 14.7 | 1.05x |
+
+MI355X verify-graph step budget: MoE 41.0%, dense attn 20.6%, index topk 9.9%,
+shared-expert MLP 6.8%, sparse decode 5.6%, AR+norm 5.0%; ~15 ms/step residual =
+EAGLE3 draft forwards + sampler + scheduler (not instrumented).
+
+### Read
+
+- GB300's 2.1x lead at C64 is led by **dense attention (9.45x; 3 layers at 60-120K
+  ctx)** and routed MoE (1.42x); AR/norm and the projection GEMMs are at parity
+  after the kernel ports.
+- ws3 (fused AR+norm) holds parity with trtllm allreduce fusion — the glue gap is
+  closed. The remaining MI355X decode gap is dense-attention-bound.
+
+### Artifacts
+
+- MI355X: `vultr-mi355x:/mnt/vfs/homes/peiyuanz/m3-compare/results-nv-amd/amd/event-c64/{off,on,on-gated}/` (SUMMARY.md, stage TSVs); optimized-stack decode record in `records/DECODE_OPTIMIZATION_RECORD.md`.
+- GB300: repro `results/mxfp8/decode-only/c64-10377/`, event `results/mxfp8-event-stage6/decode-only/c64-10388/` (exit-2 is a summary-jq bug; measurement complete); copied to `vultr:.../results-nv-amd/gb300/`.
