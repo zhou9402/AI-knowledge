@@ -105,9 +105,8 @@ FP8-native path; if only dynamic shapes regress, tune the E2E-observed buckets.
 
 ## P-only attention implementation matrix
 
-This matrix refers to the compared TP4 MXFP8 P-only results. It separates
-runtime facts confirmed by commands/source from the ATOM dense pipeline that
-still needs dispatch-level confirmation.
+This matrix refers to the compared TP4 MXFP8 P-only results. ATOM dispatch was
+confirmed with the exact 5-QPS production configuration in Slurm job 2956.
 
 The ATOM column corresponds to the run that reached 5.0 offered QPS / 4.959
 achieved QPS: TP4, 60K--120K ISL, eight prefix sessions, about 90% prefix
@@ -118,21 +117,22 @@ while dense linear layers used the PTPC-FP8 online-quant configuration.
 
 | Stage | ATOM P | vLLM deploy-safe P | Important difference |
 |---|---|---|---|
-| Dense attention selection | `ATOM_FORCE_ATTN_TRITON=1`; Triton prefill path | `ROCM_AITER_UNIFIED_ATTN` | Different runtime/backend path |
-| Dense attention core | The 5.0-QPS run confirms Triton selection but does not preserve a dispatch trace identifying every dense-attention kernel. FP8 paged-KV gather/dequant, BF16 FMHA, then prefix-chunk merge is the later ATOM-style UT candidate, not a proven description of that E2E run | `aiter.ops.triton.unified_attention.unified_attention`, directly consuming paged FP8 KV; trace kernels `kernel_unified_attention` and `kernel_unified_attention_2d` | ATOM's exact 5.0-QPS dense path still requires dispatch capture; vLLM's path is confirmed |
+| Dense attention selection | Generic `Attention`; prefix-hit P path runs `_gather_prefix_and_concat_kv` followed by AITER FlashAttention | `ROCM_AITER_UNIFIED_ATTN` | ATOM does not use Unified Attention for this run |
+| Dense attention core | `cp_mha_gather_cache_kernel` then `aiter::fmha_fwd_hd128_bf16_causal_group`; 0.78% + 11.07% of rank-0 trace GPU time | `aiter.ops.triton.unified_attention.unified_attention`, directly consuming paged FP8 KV; trace kernels `kernel_unified_attention` and `kernel_unified_attention_2d` | Gather/dequant + BF16 FMHA versus direct FP8 paged attention |
 | Sparse index cache | FP8 | FP8 | Same dtype, different surrounding layout/dispatch |
 | Sparse score/Top-K | ATOM M3 Triton indexer; `use_index_cache=true,index_topk_freq=4` | AMD Triton `_index_block_score_kernel` + `_topk_index_kernel`; production-safe config recomputes every sparse layer | ATOM recomputes once per four sparse layers and reuses selected blocks; this is an algorithmic quality trade-off, not a kernel-only speedup |
 | Sparse metadata/layout | Top-K path emits the shuffled physical page-16 sparse table directly | Top-K ids stay in the shared buffer and feed the logical page-128 path | ATOM fuses table emission; vLLM avoids the shuffled page-16 contract |
-| Sparse attention core | Forced Triton M3 sparse attention consuming the shuffled table; the exact E2E kernel symbol still needs a matched dispatch trace | AMD Triton `_gqa_sparse_fwd_kernel`, reading packed page-128 FP8 K/V directly | Both are Triton, but they are not the same kernel or cache/table contract |
+| Sparse attention core | `_run_prefill_fp8_gluon` -> `pa_decode_gluon`; main trace symbol `paged_attention_decode_sliding_window_head_1`; physical page-16 SHUFFLE FP8 KV; about 8.72% of rank-0 trace GPU time | AMD Triton `_gqa_sparse_fwd_kernel`, reading packed logical page-128 FP8 K/V directly | Gluon decode-like per-query kernel versus Triton prefill kernel |
 | Prefill graph behavior | Eager prefill despite `cudagraph_mode=FULL` | `FULL_DECODE_ONLY`, so P is eager | Effectively aligned; not the gap |
 
 `PTPC-FP8` in the ATOM run describes online quantization of dense linear
 layers/projections. It must not be confused with the attention core itself.
 
-The largest confirmed P attention difference today is sparse index/Top-K
-frequency and table construction. The dense comparison is not yet closed:
-ATOM's exact runtime kernels and dynamic-shape dispatch must be captured before
-attributing its E2E advantage to BF16 FMHA or to the conversion pipeline.
+The exact ATOM P dispatch is now closed. A matched production-shape P-side UT
+also shows the ATOM sparse core is 1.98--2.02x faster than vLLM's current
+Triton core, excluding score, Top-K, metadata construction, and cross-layer
+reuse. The trace percentages are attribution evidence only because profiling
+perturbs timing; the matched GPU-event UT is the performance comparison.
 
 ## Update policy
 
@@ -276,6 +276,10 @@ context lengths directly, avoiding a separate metadata path.
 
 Outputs matched exactly. Whole-model impact has not yet been measured, so this
 remains a kernel-qualified candidate rather than a production TPM gain.
+This 10.1--12.1% is a same-call kernel/path improvement: Top-K output and
+page-table/context metadata generation are fused. It does not include ATOM's
+cross-layer `index_topk_freq=4` reuse, which is a separate algorithmic change
+and failed the current quality gate.
 
 ## Performance-only or rejected experiments
 
@@ -362,14 +366,13 @@ Matched P-only SLA measurements are:
 The current evidence points to attention as the main remaining catch-up area,
 but it must be split into distinct paths:
 
-1. **Sparse attention and indexer:** the largest actionable target. Existing
-   traces show `_gqa_sparse_fwd_kernel`, index score, and Top-K as major costs.
-   Cross-layer reuse proves the available headroom but currently fails the
-   quality gate.
-2. **Dense attention:** fixed-shape UT has large theoretical headroom, but the
-   attempted backend substitution did not improve E2E. The exact ATOM runtime
-   path and dynamic production shapes must be reproduced before another
-   integration attempt.
+1. **Sparse attention and indexer:** the largest actionable target. The matched
+   P UT confirms ATOM's page-16 Gluon sparse core is 1.98--2.02x faster than
+   vLLM's page-128 Triton core. Cross-layer reuse is separate and still fails
+   the quality gate.
+2. **Dense attention:** ATOM's exact P path is now confirmed as gather/dequant
+   plus BF16 AITER FMHA. The fixed-shape candidate has theoretical headroom,
+   but the attempted backend substitution did not improve vLLM E2E.
 3. **MoE and linear kernels:** several useful exact-shape gains are already in
    the candidate stack, but they do not explain the full ATOM P advantage.
 4. **Graph mode:** ATOM's P path is eager even when configured with `FULL`;
@@ -395,17 +398,16 @@ Primary supporting reports:
 - [MXFP8 tuned P/D matched A/B](reports/MXFP8_TUNED_P_D_AB_2292_2297.md)
 - [ATOM fused-shared-expert screening](reports/ATOM_MXFP8_FSE_KERNEL_UT_2626.md)
 - [ATOM P versus vLLM MXFP8 gap analysis](reports/ATOM_P_VLLM_MXFP8_GAP_20260826.md)
+- [ATOM P attention dispatch and sparse UT](reports/ATOM_P_ATTENTION_DISPATCH_AND_SPARSE_UT_2956_2960.md)
 
 ## Recommended next steps
 
-1. Capture matched event-level traces for vLLM and ATOM using the same P-only
-   request replay and compare sparse attention, indexer, and dense attention by
-   exact shape.
-2. Prioritize a semantically exact page-128 FP8 sparse-attention/indexer
-   implementation; do not replace the current Triton sparse path with the
-   slower Gluon candidate.
-3. Reproduce the exact ATOM dense-attention runtime path, including dynamic
-   metadata and KV conversion overhead, before another E2E A/B.
+1. Integrate or port the validated ATOM page-16 Gluon sparse core without
+   changing Top-K frequency, then run P E2E A/B.
+2. Keep Top-K/metadata fusion separate from cross-layer reuse and qualify its
+   whole-model effect.
+3. Use the confirmed dense gather + BF16 FMHA dispatch to explain why the
+   earlier vLLM backend substitution lost its UT gain at integration.
 4. Combine fused shared expert with the deploy-safe D stack and re-run the
    component boundary; only then update the production TPM calculation.
 5. Run a model/task quality evaluation before considering Top-K frequency 4.
