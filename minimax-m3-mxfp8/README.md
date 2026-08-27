@@ -103,6 +103,30 @@ attention, together with dispatch and actual-shape logging. If the fast core is
 not selected, fix dispatch; if conversion dominates, fuse it or retain an
 FP8-native path; if only dynamic shapes regress, tune the E2E-observed buckets.
 
+## P-only attention implementation matrix
+
+This matrix refers to the compared TP4 MXFP8 P-only results. It separates
+runtime facts confirmed by commands/source from the ATOM dense pipeline that
+still needs dispatch-level confirmation.
+
+| Stage | ATOM P | vLLM deploy-safe P | Important difference |
+|---|---|---|---|
+| Dense attention selection | `ATOM_FORCE_ATTN_TRITON=1`; Triton prefill path | `ROCM_AITER_UNIFIED_ATTN` | Different runtime/backend path |
+| Dense attention core | Available source/UT evidence is consistent with FP8 paged-KV gather/dequant, BF16 FMHA, then prefix-chunk merge; exact E2E kernel dispatch is not yet captured | `aiter.ops.triton.unified_attention.unified_attention`, directly consuming paged FP8 KV; trace kernels `kernel_unified_attention` and `kernel_unified_attention_2d` | ATOM may pay conversion/merge launches; vLLM keeps FP8 KV native through the unified kernel |
+| Sparse index cache | FP8 | FP8 | Same dtype, different surrounding layout/dispatch |
+| Sparse score/Top-K | ATOM M3 Triton indexer; `use_index_cache=true,index_topk_freq=4` | AMD Triton `_index_block_score_kernel` + `_topk_index_kernel`; production-safe config recomputes every sparse layer | ATOM recomputes once per four sparse layers and reuses selected blocks; this is an algorithmic quality trade-off, not a kernel-only speedup |
+| Sparse metadata/layout | Top-K path emits the shuffled physical page-16 sparse table directly | Top-K ids stay in the shared buffer and feed the logical page-128 path | ATOM fuses table emission; vLLM avoids the shuffled page-16 contract |
+| Sparse attention core | Forced Triton M3 sparse attention consuming the shuffled table; the exact E2E kernel symbol still needs a matched dispatch trace | AMD Triton `_gqa_sparse_fwd_kernel`, reading packed page-128 FP8 K/V directly | Both are Triton, but they are not the same kernel or cache/table contract |
+| Prefill graph behavior | Eager prefill despite `cudagraph_mode=FULL` | `FULL_DECODE_ONLY`, so P is eager | Effectively aligned; not the gap |
+
+`PTPC-FP8` in the ATOM run describes online quantization of dense linear
+layers/projections. It must not be confused with the attention core itself.
+
+The largest confirmed P attention difference today is sparse index/Top-K
+frequency and table construction. The dense comparison is not yet closed:
+ATOM's exact runtime kernels and dynamic-shape dispatch must be captured before
+attributing its E2E advantage to BF16 FMHA or to the conversion pipeline.
+
 ## Update policy
 
 This repository is the canonical record for subsequent MiniMax-M3 MXFP8
