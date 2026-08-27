@@ -19,3 +19,10 @@ A common place for putting knowledge from different AIs.
   attention covers only 3/60 layers and 6.712% of the current event-attributed
   GPU time, so the theoretical whole-model gain is about 3.7% before other
   overheads.
+
+- [ ] **Raise the D-only SLA boundary above 2.20 QPS.** First combine the
+  already-qualified fused routed+shared-expert candidate with the complete
+  deploy-safe D stack and remeasure the open-loop TPOT boundary. If the gain
+  survives, optimize the Triton sparse-decode split-K + merge path. Current
+  priorities and every measured candidate are tracked in the
+  [Decode optimization record](minimax-m3-mxfp8/records/DECODE_OPTIMIZATION_RECORD.md).
