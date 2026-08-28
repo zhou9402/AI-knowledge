@@ -1,108 +1,62 @@
-# MiniMax-M3 MXFP8: MI355X versus GB300
-
 ## Latest (2026-08-28) — current best under SLA
 
-Stacks: MI355X = merged phase4 (Codex phase3 + ws1 decode MoE CSV + ws3 fused
-AR+norm; PTPC OFF per accuracy policy; vLLM ac750, aiter 0.1.19). GB300 =
-canonical production path (FLASHINFER+trtllm, EAGLE3). D protocol: TP4,
-DecodeBenchConnector, EAGLE3 draft-3 synthetic, 60-120K ISL, OSL 600.
-SLA: TPOT p50 <= 16.6 ms.
+SLA: TPOT p50 <= 16.6 ms. All numbers zero-error, warm, steady-state.
 
 ### D-only (latest)
 
-| Platform | Best point | out tok/s | TPOT p50 | QPS |
+Protocol: TP4, DecodeBenchConnector (fill 0.015), EAGLE3 draft-3 synthetic
+acceptance [0.7,0.5,0.4], 60-120K token-id ISL, exact OSL 600, closed loop
+unless noted. AMD = phase4 merged stack (Codex phase3 + ws1 decode MoE CSV +
+ws3 fused AR+norm; PTPC OFF; aiter 0.1.19). NV = canonical GB300 production
+(FLASHINFER+trtllm attn, trtllm MoE, EAGLE3).
+
+| Platform | Best under SLA | out tok/s | TPOT p50 | QPS |
 |---|---|---:|---:|---:|
 | GB300 (NV) | C72 | **3,991.1** | 16.39 ms | ~6.7 |
-| MI355X phase4 (AMD) | **C28 (sweet spot)** | 1,559.7 | 16.35 ms | **2.60** (closed-loop) |
-| MI355X phase4 open-loop | 2.4 QPS | 1,423.6 | 15.72 ms | 2.37 achieved, PASS |
+| MI355X phase4 (AMD) | C28 sweet spot (closed loop) | 1,559.7 | 16.35 ms | 2.60 |
+| MI355X phase4 open-loop | 2.4 QPS x 667 s, 1584/1584 ok | 1,423.6 | **15.72 ms** | 2.37 ach., PASS |
 
-NV/AMD at best-under-SLA: **2.56x** throughput (3,991/1,560). AMD TPOT improved
-33.2 -> 16.35 ms (-51%) across the optimization campaign; the gap is now
-dominated by dense attention (18.1x per-call) and MoE (1.50x); AR+norm and
-projections are at parity or AMD-faster.
+**NV/AMD at best-under-SLA: 2.56x throughput.** AMD D TPOT went 33.2 -> 16.35 ms
+(-51%) over the campaign (pre-opt record -> phase4). NV leads on raw throughput;
+per-token latency is nearly equal (16.39 vs 16.35 ms).
 
-Kernel detail: see the C24 per-kernel table in the historical section (same
-stack; C24 geometry: MI verify graph 37.7 ms/step — MoE 39.6%, dense attn
-24.3%, indexer 7.0%; GB300 graph 29.6 ms — dense attn only 0.51 ms/step).
+#### D kernel breakdown (event-timed, C24 geometry, per-call p50 us)
 
-### P-only (latest)
-
-| Platform | SLA sweet spot |
-|---|---:|
-| GB300 | 44,135 fresh tok/s (C8, 60-120K ISL, ~90% prefix reuse) |
-| MI355X phase3 | 35,173 tok/s (+10.8% over its baseline; 89% of ATOM) |
-| ATOM reference | 39.5K tok/s |
-
-NV/AMD P: **1.26x**. P kernel history is in the historical chapter below.
-
----
-
-## Kernel detail backing the Latest chapter (C24 geometry, 2026-08-28)
-
-C64 turned out admission-bound on MI355X (heavy queueing), so the C64 throughput
-comparison was invalid. This is the rematch at **C24**, the AMD sweet-spot region.
-Same D-only protocol as before (TP4, DecodeBenchConnector, EAGLE3 draft-3
-synthetic [0.7,0.5,0.4], 60-120K ISL, OSL 600). MI355X runs the optimized stack
-(ws1+ws2+ws3, ws4 off, aiter 0.1.19). Zero errors on all runs. Event legs carry
-~18-21% TPOT instrumentation overhead on both sides — stage tables are relative
-shares / per-call times only; capacity numbers come from the timing-OFF legs.
-
-### Capacity at C24 (timing OFF)
-
-| Platform | out tok/s | TPOT P50 | TPOT P99 | ITL P50 | TTFT P50 |
-|---|---:|---:|---:|---:|---:|
-| GB300 (job 10545) | **2,212.4** | **9.86 ms** | 11.09 ms | 24.17 ms | 320.8 ms |
-| MI355X optimized | 1,259.4 | 17.58 ms | 19.14 ms | 45.50 ms | 434.5 ms |
-| **NV / AMD** | **1.76x** | **1.78x** | 1.73x | 1.88x | — |
-
-The gap narrows vs C64 (2.10x) because C64 on MI355X was queue-bound. At C24 both
-sides run queue-free (AMD TTFT p50 435 ms vs 2,125 ms at C64).
-
-### Per-kernel/stage comparison at C24 (verify cudagraph, per-call p50 us)
-
-| stage (calls/step) | MI355X | GB300 | MI / GB |
+| stage (calls/step) | MI355X phase4 | GB300 | MI / GB |
 |---|---:|---:|---:|
-| Routed MoE (x57) | 262.0 | 174.8 | **1.50x** |
-| Dense attention (x3) | 3,060 | 169.0 | **18.1x** |
+| Routed MoE (x57) | 262.0 | 174.8 | 1.50x |
+| **Dense attention (x3)** | **3,060** | **169.0** | **18.1x** |
 | Shared-expert MLP (x57) | 49.1 | 143.4 | 0.34x (MI faster) |
-| AR+norm (x60 MI / x120 GB) | 24.5 | 23.1 | parity per call; MI does half the calls (ws3 deferral) |
+| AR+norm | 24.5 (x60, ws3-fused) | 23.1 (x120) | parity/call, MI half the calls |
 | moe_router (x57) | 12.2 | 17.2 | 0.71x (MI faster) |
 | sparse QKV proj (x57) | 18.4 | 16.7 | 1.10x |
 | attn o_proj (x60) | 14.2 | 14.0 | ~1.0x |
-| Sparse decode + indexer (MI only) | 25.6 + 30.2 | not instrumented | — |
+| Sparse decode + indexer (MI) | 25.6 + 30.2 | not instrumented | — |
 
-Per-step budgets: MI355X verify graph 37.7 ms (MoE 39.6%, dense attn 24.3%);
-GB300 verify graph ~29.6 ms instrumented (MoE 9.96 ms, shared-expert 8.17 ms,
-dense attn 0.51 ms, AR+norm 2.77 ms).
+Why dense attention is 18x and not a typo: MI runs vLLM Triton
+`unified_attention` for the 3 full-context layers — latency-bound (no
+split-KV), flat vs batch (3.06 ms at both C24 and C64). GB300's FMHA sm100
+splits KV and scales with batch (331.8 us at C64 -> 169 us at C24). Fix on MI:
+switch the 3 dense layers to aiter ASM/FMHA (Codex `opt/dense-attention-fmha`
+path). Per-step shares at C24: MI verify graph 37.7 ms — MoE 39.6%, dense attn
+24.3%, indexer 7.0%; GB300 verify graph ~29.6 ms — dense attn only 0.51 ms.
 
-**Dense attention got relatively WORSE at C24 (18.1x vs 9.4x at C64)**: the MI
-Triton unified-attention kernel is latency-bound and flat vs batch (9.2 ms/step
-at both C24 and C64), while GB300's FMHA scales down with batch. It is the #1
-kernel gap at every concurrency measured.
+### P-only (latest)
 
-### AMD sweet spot (steady-state, SLA TPOT p50 <= 16.6 ms)
+Protocol: C8, 60-120K ISL, ~90% prefix reuse, OSL 1, open-loop SLA
+(TTFT p50 < 3 s; fresh prefill tok/s at the SLA sweet point).
 
-| C | out tok/s | TPOT p50 | SLA |
-|---:|---:|---:|---|
-| C18 | 1,026.2 | 16.39 ms | PASS (sweet spot) |
-| C19 | 1,068.8 | 16.76 ms | miss (plateau edge) |
-| C20 | 1,116.3 | 16.75 ms | miss by 0.15 |
-| C22 | 1,206.2 | 17.13 ms | miss |
-| C24 | 1,259.4 | 17.59 ms | miss |
+| Platform | SLA sweet spot |
+|---|---:|
+| GB300 | **44,135 fresh tok/s** (QPS 5.54) |
+| MI355X (campaign endpoint) | **39,735 tok/s @ QPS 5.0 = 100.6% of ATOM** (39.5K), TTFT p50 1,745 ms (ATOM 2,274) |
+| ATOM reference | 39.5K tok/s |
 
-Flat C18->C20, then ~+0.4 ms/step beyond C20. If the SLA relaxes to ~16.8 ms,
-C20 is the efficient plateau. Note: an earlier single-wave C24 reference
-(15.46 ms) was reproduced by our warmup wave (15.63 ms); steady state drifts to
-17.58 ms — short-window numbers flatter the sweet point.
+NV/AMD P: **1.11x**. Caveat: the MI355X P endpoint included the PTPC dense-GEMM
+route, which the current production policy forbids (numerics); the no-PTPC
+merged line is lower — see phase3 records in history.
 
-### Artifacts
-
-- MI355X: `results-nv-amd/amd/event-c{18,19,20,22}/` and `event-c24/` (SUMMARY.md,
-  stage-table.txt, TSVs); sweet-spot scan: `results-nv-amd/amd/sweetspot.md`.
-- GB300: jobs 10545 (clean) / 10546 (event); copied to
-  `results-nv-amd/gb300-c24/` on the vultr cluster.
-
-
+---
 
 ## Historical records (all pre-2026-08-28 data below; kept for reference)
 
