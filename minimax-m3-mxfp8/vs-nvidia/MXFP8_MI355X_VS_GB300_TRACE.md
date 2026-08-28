@@ -20,7 +20,6 @@ ws3 fused AR+norm; PTPC OFF; aiter 0.1.19). NV = canonical GB300 production
 (-51%) over the campaign (pre-opt record -> phase4). NV leads on raw throughput;
 per-token latency is nearly equal (16.39 vs 16.35 ms).
 
-
 ### P-only (latest)
 
 Protocol: C8, 60-120K ISL, ~90% prefix reuse, OSL 1, open-loop SLA
@@ -60,6 +59,29 @@ splits KV and scales (331.8 us at C64 -> 169 us at C24). Fix on MI: switch the
 3 dense layers to aiter ASM/FMHA (`opt/dense-attention-fmha` path).
 Per-step shares at C24: MI verify graph 37.7 ms — MoE 39.6%, dense attn 24.3%,
 indexer 7.0%; GB300 verify graph ~29.6 ms — dense attn only 0.51 ms.
+
+### D exact trace kernel names (diagnostic only)
+
+The trace still identifies which concrete kernels execute, but its shares and
+collective latency are distorted by profiling. This table is therefore for
+kernel mapping only; it must not replace the event table above or be used for
+an Amdahl calculation.
+
+| Platform | Trace kernel | Mean us/call | Interpretation |
+|---|---|---:|---|
+| MI355X | `kernel_unified_attention` | 2,130.446 | Dense attention candidate |
+| MI355X | `decode_index_score_topk_partial_fp8` | 156.652 | Fused index-score/partial Top-K |
+| MI355X | AITER MoE1 + SwiGLU | 75.379 | Routed expert gate/up + activation |
+| MI355X | AITER MoE2 | 41.264 | Routed expert down projection |
+| MI355X | `mxfp8_linear_kernel` | 11.271 | MXFP8 dense/projection GEMM |
+| MI355X | `gqa_sparse_decode_kernel` | 14.928 | Sparse decode attention core |
+| GB300 | `kernel_unified_attention` | 1,516.991 | Dense attention candidate |
+| GB300 | FlashInfer sparse indexer Top-K | 21.386 | Top-K portion; not one-to-one with AMD fused kernel |
+| GB300 | MiniMax index-decode score | 18.586 | Score portion; not one-to-one with AMD fused kernel |
+| GB300 | TRT-LLM MXFP8 MoE gate/up BMM | 45.278 | Dominant gate/up shape |
+| GB300 | TRT-LLM MXFP8 MoE down BMM | 28.692 | Dominant down shape |
+| GB300 | FlashInfer MXFP8 dense GEMM | 9.496 | MXFP8 dense/projection GEMM |
+| GB300 | `gqa_sparse_decode_kernel` | 16.251 | Sparse decode attention core |
 
 ### P kernel/stage comparison (C8; MI SOTA = production-legal stack)
 
@@ -167,27 +189,4 @@ eight were waiting. The like-for-like resident C48--C64 range shows GB300 at
 > C24 sweet-spot rematch further down (the C64 AMD arm was later found
 > admission-bound; use the C24 section for current AMD data).
 
-
-#### D exact trace kernel names (diagnostic only)
-
-The trace still identifies which concrete kernels execute, but its shares and
-collective latency are distorted by profiling. This table is therefore for
-kernel mapping only; it must not replace the event table above or be used for
-an Amdahl calculation.
-
-| Platform | Trace kernel | Mean us/call | Interpretation |
-|---|---|---:|---|
-| MI355X | `kernel_unified_attention` | 2,130.446 | Dense attention candidate |
-| MI355X | `decode_index_score_topk_partial_fp8` | 156.652 | Fused index-score/partial Top-K |
-| MI355X | AITER MoE1 + SwiGLU | 75.379 | Routed expert gate/up + activation |
-| MI355X | AITER MoE2 | 41.264 | Routed expert down projection |
-| MI355X | `mxfp8_linear_kernel` | 11.271 | MXFP8 dense/projection GEMM |
-| MI355X | `gqa_sparse_decode_kernel` | 14.928 | Sparse decode attention core |
-| GB300 | `kernel_unified_attention` | 1,516.991 | Dense attention candidate |
-| GB300 | FlashInfer sparse indexer Top-K | 21.386 | Top-K portion; not one-to-one with AMD fused kernel |
-| GB300 | MiniMax index-decode score | 18.586 | Score portion; not one-to-one with AMD fused kernel |
-| GB300 | TRT-LLM MXFP8 MoE gate/up BMM | 45.278 | Dominant gate/up shape |
-| GB300 | TRT-LLM MXFP8 MoE down BMM | 28.692 | Dominant down shape |
-| GB300 | FlashInfer MXFP8 dense GEMM | 9.496 | MXFP8 dense/projection GEMM |
-| GB300 | `gqa_sparse_decode_kernel` | 16.251 | Sparse decode attention core |
 ---
