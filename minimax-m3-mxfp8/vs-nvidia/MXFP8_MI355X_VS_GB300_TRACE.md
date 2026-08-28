@@ -20,26 +20,6 @@ ws3 fused AR+norm; PTPC OFF; aiter 0.1.19). NV = canonical GB300 production
 (-51%) over the campaign (pre-opt record -> phase4). NV leads on raw throughput;
 per-token latency is nearly equal (16.39 vs 16.35 ms).
 
-#### D kernel breakdown (event-timed, C24 geometry, per-call p50 us)
-
-| stage (calls/step) | MI355X phase4 | GB300 | MI / GB |
-|---|---:|---:|---:|
-| Routed MoE (x57) | 262.0 | 174.8 | 1.50x |
-| **Dense attention (x3)** | **3,060** | **169.0** | **18.1x** |
-| Shared-expert MLP (x57) | 49.1 | 143.4 | 0.34x (MI faster) |
-| AR+norm | 24.5 (x60, ws3-fused) | 23.1 (x120) | parity/call, MI half the calls |
-| moe_router (x57) | 12.2 | 17.2 | 0.71x (MI faster) |
-| sparse QKV proj (x57) | 18.4 | 16.7 | 1.10x |
-| attn o_proj (x60) | 14.2 | 14.0 | ~1.0x |
-| Sparse decode + indexer (MI) | 25.6 + 30.2 | not instrumented | — |
-
-Why dense attention is 18x and not a typo: MI runs vLLM Triton
-`unified_attention` for the 3 full-context layers — latency-bound (no
-split-KV), flat vs batch (3.06 ms at both C24 and C64). GB300's FMHA sm100
-splits KV and scales with batch (331.8 us at C64 -> 169 us at C24). Fix on MI:
-switch the 3 dense layers to aiter ASM/FMHA (Codex `opt/dense-attention-fmha`
-path). Per-step shares at C24: MI verify graph 37.7 ms — MoE 39.6%, dense attn
-24.3%, indexer 7.0%; GB300 verify graph ~29.6 ms — dense attn only 0.51 ms.
 
 ### P-only (latest)
 
@@ -187,48 +167,6 @@ eight were waiting. The like-for-like resident C48--C64 range shows GB300 at
 > C24 sweet-spot rematch further down (the C64 AMD arm was later found
 > admission-bound; use the C24 section for current AMD data).
 
-### D trace validity correction
-
-The earlier Kineto trace reported 51.41% of summed MI355X GPU time as
-collective/synchronization. That number is invalid for kernel-share or
-critical-path comparison: profiling reduced MI355X C16 throughput by about
-70% and greatly amplified device-side synchronization waits. It is therefore
-removed from the comparison table and must not be used to diagnose D.
-
-The NVIDIA and AMD profiler-family percentages are also not directly
-comparable under this asymmetric perturbation. A matched low-overhead event
-run on both platforms would be required for a valid family-by-family D
-comparison.
-
-### Authoritative MI355X D event breakdown
-
-Low-overhead HIP events later measured the complete target iteration at
-55.053 ms:
-
-| Execution boundary | Time | Share |
-|---|---:|---:|
-| Dense-attention path | 9.088 ms | 16.51% |
-| Sparse-attention path | 16.622 ms | 30.19% |
-| MoE | 13.490 ms | 24.50% |
-| AllReduce + norm | 1.240 ms | 2.25% |
-| Dense-layer MLP | 0.273 ms | 0.50% |
-| Other captured-graph work | 14.340 ms | 26.05% |
-
-#### D nested event targets
-
-These event boundaries are contained in the rows above and must not be added
-again. They are the finest trustworthy D critical-path attribution currently
-available.
-
-| Kernel/stage boundary | MI355X ms/iteration | Iteration share |
-|---|---:|---:|
-| Routed-expert / routing residual | 9.890 | 17.96% |
-| Dense-attention backend core | 8.868 | 16.11% |
-| Sparse-attention body, excluding indexer | 7.854 | 14.27% |
-| Indexer | 4.943 | 8.98% |
-| Sparse projections / cache / output | 3.825 | 6.95% |
-| Shared-expert MLP | 2.868 | 5.21% |
-| MoE router gate | 0.732 | 1.33% |
 
 #### D exact trace kernel names (diagnostic only)
 
@@ -252,47 +190,4 @@ an Amdahl calculation.
 | GB300 | TRT-LLM MXFP8 MoE down BMM | 28.692 | Dominant down shape |
 | GB300 | FlashInfer MXFP8 dense GEMM | 9.496 | MXFP8 dense/projection GEMM |
 | GB300 | `gqa_sparse_decode_kernel` | 16.251 | Sparse decode attention core |
-
-The two platforms do not always use one-to-one kernel decomposition. For
-example, AMD fuses index score and partial Top-K while GB300 reports separate
-score and Top-K kernels. Direct ratios should only be computed for equivalent
-boundaries under matched event timing.
-
-The supported conclusion is that MI355X D is primarily limited by
-attention/indexer and remaining graph work, not communication bandwidth. The
-older profiler suggests that MoE is unlikely to explain the gap, but that
-cross-platform family comparison remains directional rather than an
-authoritative event-timed result.
-
-## Optimization priorities
-
-1. P: dense attention, routed MoE, and sparse attention.
-2. D (updated 2026-08-28, C24 sweet-spot data): dense attention remains the
-   top kernel target (18.1x per-call at C24, ~9.2 ms/step; MI Triton unified
-   attention is latency-bound with no split-KV — fix = aiter ASM/FMHA path);
-   routed MoE is 1.50x; AR+norm and projection GEMMs are at parity (or MI
-   faster after the kernel ports). The connector fill/queue path drives the
-   residency gap (scheduling/connector problem, not a kernel one). AMD sweet
-   spot on the merged stack: C28 (1,559.7 tok/s, TPOT p50 16.35 ms).
-3. Treat the profiler-only 51.41% collective share as invalidated by
-   instrumentation interference.
-4. Use clean runs for capacity and low-overhead events for attribution.
-
-## Provenance
-
-- MI355X P event job: 2177.
-- GB300 P event job: 9695.
-- MI355X SOTA (integration/p1) jobs: 3155 (control), 3156 (event); kernel
-  profile job: 3173.
-- MI355X D profiler job: 2221.
-- GB300 D profiler job: 9724.
-- Corrected MI355X D event job: 2239.
-- 2026-08-27 D rematch: MI355X event legs `results-nv-amd/amd/event-c64/`
-  (off = clean capacity, on = event timing; vultr-mi355x, vllm-bench-ac750,
-  192 prompts, seed 42, hot graph 13885675626448); GB300 repro job 10377 and
-  event job 10388 (hot graph 266659190723344). Analysis scripts and tables:
-  `tools/m3_compare/nv-amd-compare/` and remote `results-nv-amd/compare/`.
-- Original working-tree report:
-  `benchmarks/kernels/minimax_m3/MXFP8_PONLY_C8_MI355X_VS_GB300_KERNEL_TIMING.md`.
-
 ---
