@@ -45,47 +45,43 @@ path). Per-step shares at C24: MI verify graph 37.7 ms — MoE 39.6%, dense attn
 
 Protocol: C8, 60-120K ISL, ~90% prefix reuse, OSL 1, open-loop SLA
 (TTFT p50 < 3 s; fresh prefill tok/s at the SLA sweet point).
+The MI355X number is the production-legal SOTA: no PTPC dense-GEMM route and
+no index top-k sharing (both are numerics/policy-restricted).
 
 | Platform | SLA sweet spot |
 |---|---:|
 | GB300 | **44,135 fresh tok/s** (QPS 5.54) |
-| MI355X (campaign endpoint) | **39,735 tok/s @ QPS 5.0 = 100.6% of ATOM** (39.5K), TTFT p50 1,745 ms (ATOM 2,274) |
+| MI355X SOTA (integration/p1, 2026-08-27) | **29,446.6 tok/s @ QPS 3.70**, TTFT p50 2,183.7 ms |
 | ATOM reference | 39.5K tok/s |
 
-NV/AMD P: **1.11x**. Caveat: the MI355X P endpoint included the PTPC dense-GEMM
-route, which the current production policy forbids (numerics); the no-PTPC
-merged line is lower — see phase3 records in history.
+NV/AMD P: **1.50x**. (The 39.7K = 100.6%-of-ATOM figure used PTPC + top-k
+sharing and is not production-legal under the current accuracy policy; it lives
+in the historical chapter.)
 
----
+## Kernel breakdown (event-timed, AMD MI355X phase4 vs NV GB300)
 
-## Historical records (all pre-2026-08-28 data below; kept for reference)
+### D (verify cudagraph, C24 geometry, per-call p50 us)
 
-## Scope
-
-This record compares the TP4 MXFP8 production paths on MI355X and GB300.
-Both sides use MXFP8 target weights, FP8 main/index KV, and the same logical
-MiniMax-M3 P-only and D-only workloads. GPU events are preferred for critical
-path attribution; profiler totals are retained only where they help identify
-kernel families.
-
-## P-only result
-
-Matched workload: C8, 60K--120K ISL, about 90% prefix reuse, OSL1, two client
-warm-ups, and 48 measured requests.
-
-| Platform | Instrumented fresh tok/s | Request/s | TTFT P50 |
+| stage (calls/step) | MI355X | GB300 | MI / GB |
 |---|---:|---:|---:|
-| MI355X | 21,315.20 | 2.6757 | 3,033.02 ms |
-| MI355X SOTA (2026-08-27, integration/p1) | 29,446.58 | 3.6965 | 2,183.68 ms |
-| GB300 | 44,135.29 | 5.5404 | 1,415.08 ms |
-| GB300 / MI355X | **2.071x** | **2.071x** | -- |
-| GB300 / MI355X SOTA | **1.499x** | **1.499x** | -- |
+| Routed MoE (x57) | 262.0 | 174.8 | 1.50x |
+| **Dense attention (x3)** | **3,060** | **169.0** | **18.1x** |
+| Shared-expert MLP (x57) | 49.1 | 143.4 | 0.34x (MI faster) |
+| AR+norm | 24.5 (x60, ws3-fused) | 23.1 (x120) | parity/call, MI half the calls |
+| moe_router (x57) | 12.2 | 17.2 | 0.71x (MI faster) |
+| sparse QKV proj (x57) | 18.4 | 16.7 | 1.10x |
+| attn o_proj (x60) | 14.2 | 14.0 | ~1.0x |
+| Sparse decode + indexer (MI) | 25.6 + 30.2 | not instrumented | — |
 
-The uninstrumented GB300 control reached 46,527.69 fresh tok/s. Event
-instrumentation reduced GB300 throughput by 5.14%, so it did not inflate the
-reported NVIDIA advantage.
+Dense-attention 18.1x is real, not a typo: MI runs vLLM Triton
+`unified_attention` for the 3 full-context layers — latency-bound (no
+split-KV), flat vs batch (3.06 ms at both C24 and C64). GB300's FMHA sm100
+splits KV and scales (331.8 us at C64 -> 169 us at C24). Fix on MI: switch the
+3 dense layers to aiter ASM/FMHA (`opt/dense-attention-fmha` path).
+Per-step shares at C24: MI verify graph 37.7 ms — MoE 39.6%, dense attn 24.3%,
+indexer 7.0%; GB300 verify graph ~29.6 ms — dense attn only 0.51 ms.
 
-### P kernel/stage comparison
+### P kernel/stage comparison (C8; MI SOTA = production-legal stack)
 
 Times are mean microseconds per call. Stages are nested and must not be added.
 
@@ -137,6 +133,35 @@ measured with matching low-overhead device events.
 The largest removable P budgets are routed MoE (89.104 ms/pass), dense
 attention core (102.822 ms/pass despite appearing in only three layers), and
 sparse attention (41.556 ms/pass).
+
+
+
+## Historical records (all pre-2026-08-28 data below; kept for reference)
+
+## Scope
+
+This record compares the TP4 MXFP8 production paths on MI355X and GB300.
+Both sides use MXFP8 target weights, FP8 main/index KV, and the same logical
+MiniMax-M3 P-only and D-only workloads. GPU events are preferred for critical
+path attribution; profiler totals are retained only where they help identify
+kernel families.
+
+## P-only result
+
+Matched workload: C8, 60K--120K ISL, about 90% prefix reuse, OSL1, two client
+warm-ups, and 48 measured requests.
+
+| Platform | Instrumented fresh tok/s | Request/s | TTFT P50 |
+|---|---:|---:|---:|
+| MI355X | 21,315.20 | 2.6757 | 3,033.02 ms |
+| MI355X SOTA (2026-08-27, integration/p1) | 29,446.58 | 3.6965 | 2,183.68 ms |
+| GB300 | 44,135.29 | 5.5404 | 1,415.08 ms |
+| GB300 / MI355X | **2.071x** | **2.071x** | -- |
+| GB300 / MI355X SOTA | **1.499x** | **1.499x** | -- |
+
+The uninstrumented GB300 control reached 46,527.69 fresh tok/s. Event
+instrumentation reduced GB300 throughput by 5.14%, so it did not inflate the
+reported NVIDIA advantage.
 
 ## D-only result
 
