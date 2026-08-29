@@ -35,6 +35,29 @@ run through the enroot harness with the pure image; see each sbatch header.
 | SciCode | `run_eval_scicode_vllm.sh` | `eval_scicode_vllm.sbatch` (1 per node = 1 repeat) | official repo inspect_ai integration, `with_background=True`, single epoch per job |
 | τ²-Telecom | `run_tau2_telecom.sh` | `eval_tau2_telecom.sbatch` | sierra tau2-bench, agent=M3, user-sim=Qwen3-235B (tool-calling enabled on both) |
 
+## 1P1D disaggregated serving (MoRI-IO), merged next-gen tree
+
+GSM8K on the **P/D-disaggregated** deployment (1P1D, TP4+TP4 packed on one
+8xMI355X node, MoRI-IO RDMA KV transfer + moriio toy proxy) running the merged
+**zhou9402/vllm @ M3-AMD** tree (upstream main 2026-08-28 + MiniMax-M3 overlay,
+nightly ROCm image `vllm-openai-rocm-nightly-d626108b`), phase4 stack with
+**real** EAGLE3 rejection sampling:
+
+| Config | GSM8K 5-shot (limit=500) | Verdict |
+|---|---:|---|
+| 1P1D, quick all-reduce off | **0.950 ± 0.0098** (flex = strict) | ✅ |
+| 1P1D, `VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=INT4` | **0.954 ± 0.0094** | ✅ INT4 accuracy-neutral |
+
+Matches the single-node reference (0.94–0.95) and the NV card baseline (95.30
+full-precision) within noise. Note: this run kept `index_topk_freq=4` from the
+phase4 D-side config; per pitfall #1 it is harmless at GSM8K context lengths.
+
+Fix required on the merged tree for PD correctness under load:
+`moriio: trim producer tail block holding only the first sampled token`
+(M3-AMD `e4c957dd3`) — ports the image's `moriio_write_handoff_tail.patch`
+(prompt_len % 128 == 0 crashed the write path with
+`local_block_ids longer than remote_block_ids`).
+
 ## Pitfalls found (each cost real points)
 
 1. **Index cache kills long context.** `use_index_cache=true,
