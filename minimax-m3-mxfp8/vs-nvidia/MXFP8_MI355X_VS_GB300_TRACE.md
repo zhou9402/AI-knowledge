@@ -10,6 +10,20 @@ unless noted. AMD = phase4 merged stack (Codex phase3 + ws1 decode MoE CSV +
 ws3 fused AR+norm; PTPC OFF; aiter 0.1.19). NV = canonical GB300 production
 (FLASHINFER+trtllm attn, trtllm MoE, EAGLE3).
 
+#### Index-sharing configuration audit
+
+The GB300 results in this report did **not** enable cross-layer index-result
+sharing. The saved commands for P job 9695 and D jobs 9582/9724 contain no
+`--hf-overrides`, and the pinned model config contains neither
+`use_index_cache` nor `index_topk_freq`. The NVIDIA implementation invokes its
+indexer on every sparse-attention layer.
+
+NVIDIA does support an FP8 index KV cache and a graph-stable Top-K output
+workspace shared by the indexer layers. That is storage/workspace reuse, not
+ATOM-style cross-layer result reuse: it does not skip score/Top-K computation
+for three out of four sparse layers. Therefore the GB300 numbers here are
+equivalent to `index_topk_freq=1`, not `index_topk_freq=4`.
+
 | Platform | Best under SLA | out tok/s | TPOT p50 | QPS |
 |---|---|---:|---:|---:|
 | GB300 (NV) | C72 | **3,991.1** | 16.39 ms | ~6.7 |
