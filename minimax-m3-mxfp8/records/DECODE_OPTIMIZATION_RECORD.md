@@ -148,7 +148,65 @@ E2E 下 gluon sparse-decode 路径在 vLLM eager attend 下大败：c32/c64 TPOT
 | Generic routed-FMoE CSV tuning | Best graph gain ~1.57% | Exhausted; kernel change required |
 | D INT4 QuickReduce | 通信占比小，精度/launch 风险不值 | Low priority |
 
+## Gluon attention 全量替换（D-only + PD，2026-08-29）
+
+### 背景
+
+- PR52849（gluon 支持 EAGLE3 多 token + dense 层）打通 gluon 全量替换路径；此前 WS4 的 eager 教训（python glue + block-table host 开销淹没 kernel 收益）在 M3-AMD 树上不存在——decode 已全 graph，eager 问题不再适用。
+
+### A/B 判决（M3-AMD 栈，C24/C28，生产协议）
+
+gluon 全开**打平**：kernel 赢、glue 亏，两者相抵。
+
+### 拆账定位
+
+| 项 | 结论 |
+|---|---|
+| dense gluon | −34%/call，收益已兑现 |
+| sparse glue（KV insert + 页表构建） | ~2.2ms/step，吃掉 kernel 收益 |
+| **EAGLE3 draft** | 占每步 28–33%，是最大杠杆 |
+
+### 收益实现（两步）
+
+1. **融合 SHUFFLE KV/index 写入**：移植 ATOM 的 fused kernel（UT 3.7×，字节一致）→ 修平 sparse glue 回退。
+2. **draft 也上 gluon**：gate 放宽 query-group 1 + draft metadata no-op（排查中发现 draft 实际跑 TP4 而非配置的 TP1）→ **C24 1745.8 tok/s / TPOT 12.52ms（较基线 +17.4% / −14.6%）**，C28 TPOT 13.98ms（−16.8%）。
+
+### 正确性
+
+抓到并修复 sparse-prefill 页表 stride bug（8 vs 16 packed；benchmark 的假 KV 永远踩不到该路径）→ 修复后 GSM8K 0.99（参照 0.96）。
+
+### SLA 甜点（修复后全 gluon 栈）
+
+| C | output tok/s | TPOT p50 (ms) | 备注 |
+|--:|---:|---:|---|
+| 24 | 1745.8 | 12.52 | |
+| 28 | 1857.6 | 13.98 | |
+| 32 | 2048 | — | |
+| 36 | 2065.9 | — | |
+| **40** | **2254.8** | **15.88** | **3.76 QPS，SLA 内最高点** |
+| 44 | — | 17.28 | 破线 |
+
+C28 TTFT 尾巴是冷启动假象（7 次干净复测未复现）。
+
+### PD 双端 gluon 验证（2026-08-29）
+
+- 1P1D + MoRIIO（RDMA）跑通；temp 0 钉死下 **PD 0.95 == D-only 0.95**，无 PD 回退。
+- 口径注意：历史参考值是 temp=1.0 采样跑的，本次起统一 temp 0。
+- stride-aware connector 不需要旧的 shuffled-KV 注册 patch。
+
+### 代码与数据位置
+
+- 代码：`github.com/zhou9402/vllm` 分支 `opt/pr52849-gluon-mtp-m3amd` + `opt/draft-gluon-pa`（de29b03ab）
+- 数据（vultr）：`/mnt/vfs/homes/peiyuanz/m3-compare/results-gluon-m3amd/`（`REPORT.md`、`sweetspot-gluon.md`、`results-pd-gluon/verdict.md`）
+
+### 遗留
+
+- C28 TTFT 双峰尾巴的根治
+- prefill 融合发射的正确修法
+- dense gluon 的进一步调优空间
+
 ## Change log
 
 - 2026-08-27：Codex 建立记录，优先级为 final-stack fused-expert 验证先于 sparse-decode kernel 工作。
 - 2026-08-27：kernel-port campaign（ws1–ws4 + 集成 E2E + Leg B）合并入本记录；Stack A +4.5~7.3%，Leg B c64 +14.7%；ws4 推翻 "gluon 2.7× slower" 结论。
+- 2026-08-29：Gluon attention 全量替换（D-only + PD）——draft 上 gluon 后 C24 +17.4% / TPOT −14.6%；SLA 甜点 C40 2254.8 tok/s / 3.76 QPS / TPOT 15.88ms；PD 双端 gluon 验证通过（PD 0.95 == D-only 0.95，temp 0）。
