@@ -3,6 +3,7 @@
 ## Cross-platform comparison
 
 - [MI355X versus GB300 MXFP8 trace and event comparison](vs-nvidia/MXFP8_MI355X_VS_GB300_TRACE.md)
+- [B300 MXFP8 component capacity update (2026-08-31)](vs-nvidia/B300_MXFP8_COMPONENT_CAPACITY_20260831.md)
 
 ## Executive summary
 
