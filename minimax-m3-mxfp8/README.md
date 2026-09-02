@@ -4,6 +4,7 @@
 
 - [MI355X versus GB300 MXFP8 trace and event comparison](vs-nvidia/MXFP8_MI355X_VS_GB300_TRACE.md)
 - [B300 MXFP8 component capacity update (2026-08-31)](vs-nvidia/B300_MXFP8_COMPONENT_CAPACITY_20260831.md)
+- [MI355X decode kernel census, optimized indexer stack (2026-09-02)](vs-nvidia/MI355X_DECODE_KERNEL_CENSUS_20260902.md)
 
 ## Executive summary
 
